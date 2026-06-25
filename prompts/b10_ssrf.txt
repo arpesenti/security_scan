@@ -1,0 +1,35 @@
+Analyze this source code file for **Server-Side Request Forgery (SSRF)** vulnerabilities (OWASP B10:2025).
+
+Look for:
+- User-controlled URLs passed to HTTP clients (HttpClient, urllib, requests, curl, NSURLConnection)
+- URL-based file inclusion or document loading from user input
+- Redirect vulnerabilities that bypass URL validation (following redirects to internal addresses)
+- DNS rebinding vulnerabilities (no DNS result validation, trusting DNS without caching)
+- Internal network access via user-controlled URLs (127.0.0.1, 10.x.x.x, 192.168.x.x, 172.16-31.x.x)
+- Cloud metadata endpoint access (http://169.254.169.254 for AWS/Azure/GCP metadata)
+- Protocol-based SSRF (gopher://, dict://, file://, php://, expect:// wrappers)
+- URL parsing vulnerabilities (IPv6, Unicode, double-encoding bypasses)
+- Image/document processing from user-supplied URLs without validation
+- Webhook endpoints that accept arbitrary callback URLs
+- Proxy functionality that forwards requests to user-specified destinations
+- Missing allowlist/ denylist for outbound connections
+- SSRF via file upload (metadata extraction from remote URLs)
+- SSRF via API that fetches external resources (RSS feeds, social media embeds)
+- Insufficient validation of hostname vs resolved IP address
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of the SSRF vulnerability
+5. Suggested fix
+
+If no SSRF vulnerabilities are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---

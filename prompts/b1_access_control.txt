@@ -1,0 +1,30 @@
+Analyze this source code file for **Broken Access Control** vulnerabilities (OWASP B1:2025).
+
+Look for:
+- Missing or incomplete authorization checks on sensitive operations
+- Direct object references (IDOR) where users can access other users' data by changing IDs/indices
+- Privilege escalation paths (regular user acting as admin)
+- Missing enforcement points on API endpoints or URL patterns
+- Insecure direct access to files, database records, or session data
+- Bypassing access controls via HTTP method manipulation (GET vs POST, PUT/DELETE exposure)
+- Role checks that can be circumvented (client-side role checks, missing server-side validation)
+- Missing rate limiting or brute-force protection on authentication endpoints
+- Insecure CORS configurations that allow cross-origin access
+- Function-level access control missing (horizontal/vertical privilege escalation)
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of why it is vulnerable
+5. Suggested fix
+
+If no Broken Access Control vulnerabilities are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---

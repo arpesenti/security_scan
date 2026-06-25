@@ -1,0 +1,31 @@
+Analyze this source code file for **Cryptographic Failures** vulnerabilities (OWASP B2:2025).
+
+Look for:
+- Use of weak or broken algorithms (MD5, SHA1, DES, RC4, ECB mode, unkeyed hashing)
+- Hardcoded cryptographic keys, IVs, salts, or passwords in source code
+- Missing encryption for sensitive data at rest or in transit
+- Use of insecure random number generators for crypto operations (Math.random, rand())
+- Padding oracle vulnerabilities, malleable encryption modes
+- Insecure key storage (keys in config files, source control, or without proper key management)
+- Missing or weak password hashing (no salt, low iteration count, plain-text passwords)
+- TLS/SSL configuration issues (weak ciphers, expired certificates, self-signed certs used in prod)
+- Information leakage through cryptographic operations (timing attacks, side channels)
+- Use of deprecated or removed cryptographic standards
+- Missing integrity verification for encrypted data (no MAC, no HMAC, no AEAD)
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of why it is vulnerable
+5. Suggested fix
+
+If no Cryptographic Failures are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---

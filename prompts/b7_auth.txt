@@ -1,0 +1,35 @@
+Analyze this source code file for **Identification and Authentication Failures** (OWASP B7:2025).
+
+Look for:
+- Weak password policies (no minimum length, no complexity requirements)
+- Passwords stored in plain text or with weak hashing (MD5, SHA1)
+- Session fixation vulnerabilities (session ID not rotated after login)
+- Missing or inadequate brute-force protection (no account lockout, no rate limiting)
+- Credentials exposed in URLs, logs, or error messages
+- Missing multi-factor authentication (MFA) for sensitive operations
+- JWT issues: weak secrets, missing expiration, missing signature validation, alg:none attacks
+- Session management flaws: missing timeout, session ID in URL, insecure cookie flags
+- Credential stuffing vulnerabilities (no CAPTCHA, no velocity checks)
+- OAuth/OIDC misconfigurations (missing state parameter, missing PKCE, open redirect)
+- Account enumeration via different error messages for valid/invalid usernames
+- Password reset token vulnerabilities (predictable tokens, no expiration, no single-use)
+- Remember-me functionality with insecure implementation
+- Insecure credential transmission (HTTP POST for login instead of HTTPS)
+- API key/token leakage in source code or configuration files
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of the authentication failure
+5. Suggested fix
+
+If no authentication failures are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---

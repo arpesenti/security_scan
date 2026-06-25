@@ -1,0 +1,35 @@
+Analyze this source code file for **Insecure Design** vulnerabilities (OWASP B4:2025).
+
+Look for:
+- Missing or inadequate threat modeling patterns
+- Business logic flaws that allow workflow bypass (e.g., skipping payment steps)
+- Missing anti-automation or abuse prevention controls
+- Inadequate input validation at architectural boundaries
+- Design patterns that assume trusted inputs at any layer
+- Missing rate limiting or throttling at the design level
+- Insecure default configurations in APIs or services
+- Lack of defense-in-depth (single point of failure in security)
+- Missing security requirements for data flow between components
+- Use of convenience over security (e.g., returning detailed error messages to users)
+- Inadequate session management design (missing rotation, insecure timeout defaults)
+- API design that exposes more data than necessary (over-fetching, bulk operations without limits)
+
+Note: Insecure Design is about the architecture and design decisions, not just code-level bugs.
+Focus on patterns that suggest fundamental design flaws rather than simple coding mistakes.
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of why the design is insecure
+5. Suggested fix
+
+If no Insecure Design issues are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---

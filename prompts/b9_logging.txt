@@ -1,0 +1,36 @@
+Analyze this source code file for **Security Logging and Monitoring Failures** (OWASP B9:2025).
+
+Look for:
+- Missing logging for security-relevant events (login attempts, access control failures, privilege changes)
+- Sensitive data logged in plain text (passwords, tokens, PII, credit card numbers)
+- Log injection vulnerabilities (user input written directly to logs without sanitization)
+- Inadequate log retention or rotation policies
+- Missing correlation IDs for distributed tracing of security events
+- Security events logged without sufficient context (no user ID, no IP, no action)
+- Logs accessible to unauthenticated or unauthorized users
+- Missing real-time alerting for critical security events
+- Inconsistent logging formats that make detection difficult
+- Log tampering or log deletion without audit trail
+- Excessive logging that creates noise and hides important events
+- Missing monitoring for data exfiltration patterns
+- Error handling that suppresses security-relevant information
+- Asynchronous logging that may lose events during failures
+- Logs stored without integrity protection (no signed logs, no append-only)
+- Missing security event aggregation across services
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of the logging/monitoring failure
+5. Suggested fix
+
+If no logging failures are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---

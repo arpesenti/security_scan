@@ -1,0 +1,36 @@
+Analyze this source code file for **Vulnerable and Outdated Components** issues (OWASP B6:2025).
+
+This scanner focuses on dependency management files and build configurations.
+
+Look for:
+- Dependencies with known critical vulnerabilities (log4j, jackson-databind, spring-framework, etc.)
+- Use of deprecated, EOL, or unmaintained libraries
+- Dependencies pinned to known-vulnerable versions
+- Missing version pinning (floating versions that could pull in vulnerable updates)
+- SNAPSHOT or development versions used in production builds
+- Components from untrusted or non-official repositories
+- Self-signed certificates in dependency chains
+- Native libraries (JNI, .dll, .so) without integrity verification
+- Components with known supply chain vulnerabilities
+- Missing SBOM (Software Bill of Materials) generation in build process
+- Insecure download URLs for dependencies (HTTP instead of HTTPS)
+- Components that introduce unnecessary attack surface (large dependencies for simple tasks)
+- Build scripts that execute remote code or download dependencies without verification
+- Third-party components with debug/logging modes enabled
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of the vulnerability
+5. Suggested fix
+
+If no vulnerable component issues are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---

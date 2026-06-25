@@ -1,0 +1,35 @@
+Analyze this source code file for **Software and Data Integrity Failures** (OWASP B8:2025).
+
+Look for:
+- Insecure deserialization (Java ObjectInputStream, Python pickle, PHP unserialize, YAML load)
+- Deserialization of untrusted data without type validation or allowlisting
+- Missing code signing verification for plugins, modules, or extensions
+- CI/CD pipeline integrity issues (unverified artifact sources, insecure build processes)
+- Insecure file upload handling (no type validation, no malware scanning)
+- Use of eval() or equivalent dynamic code execution on user-controlled input
+- Missing integrity checks for downloaded files, updates, or patches
+- Configuration files loaded from writable locations
+- Data stored without integrity verification (no checksums, no HMAC)
+- ORM frameworks that allow deserialization of untrusted objects
+- Insecure handling of JSON/XML/YAML input that could lead to object injection
+- Missing validation of data from internal services (assuming internal = trusted)
+- Build artifacts or dependencies from unverified or compromised sources
+- Insecure backup and restore processes that don't verify data integrity
+- Use of reflection or dynamic class loading with user-controlled class names
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of the integrity failure
+5. Suggested fix
+
+If no data integrity failures are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---

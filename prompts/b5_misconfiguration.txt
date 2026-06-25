@@ -1,0 +1,35 @@
+Analyze this source code file for **Security Misconfiguration** issues (OWASP B5:2025).
+
+Look for:
+- Debug mode, verbose error pages, or stack traces enabled in production configurations
+- Default credentials, admin accounts with default passwords, or hardcoded test credentials
+- Overly permissive CORS configurations (Access-Control-Allow-Origin: *)
+- Missing security headers (HSTS, X-Frame-Options, Content-Security-Policy, X-Content-Type-Options)
+- Unnecessary services, ports, or features enabled (default pages, directory listing)
+- Cloud storage buckets (S3, Azure Blob) with public or overly permissive access
+- Insecure transport (HTTP instead of HTTPS, missing certificate validation)
+- Database servers with default configurations (remote access, root login)
+- Auto-complete enabled on sensitive input fields (passwords, credit cards)
+- Missing or overly broad file permissions in deployment configs
+- HTTP methods enabled that shouldn't be (TRACE, OPTIONS on sensitive endpoints)
+- Server version information exposed in headers or responses
+- Cookie flags missing (Secure, HttpOnly, SameSite)
+- Backup files, config templates, or .sample files deployed to production
+- Missing security group rules or overly open firewall configurations
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of the misconfiguration
+5. Suggested fix
+
+If no Security Misconfiguration issues are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---

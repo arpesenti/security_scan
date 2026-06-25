@@ -1,0 +1,51 @@
+Analyze this source code file for **Injection** vulnerabilities (OWASP B3:2025).
+
+Look for ALL injection types, not just SQL:
+
+SQL Injection:
+- Direct string concatenation/interpolation into SQL queries
+- Unparameterized query construction
+- Dynamic table/column names from user input
+- Stored procedures called with unsanitized input
+- ORM/query builder usage that bypasses parameterization
+- Second-order injection via stored data
+
+Command Injection:
+- Passing user input to system() or ProcessBuilder without validation
+- Shell command construction via string concatenation
+- OS command injection through subprocess calls
+- Deserialization of untrusted data in shell context
+
+LDAP Injection:
+- LDAP query construction from user input without escaping
+
+XML Injection (XXE):
+- XML parsers with external entity processing enabled
+- Unrestricted XML input processing
+
+Template Injection:
+- Server-side template engines (Jinja2, Thymeleaf, Twig, Mustache) evaluating user input
+- Expression language injection
+
+NoSQL Injection:
+- MongoDB, Redis, or other NoSQL query construction with user input
+
+SSI (Server-Side Include) Injection:
+- User input in server-side include directives
+
+For each vulnerability found, report:
+1. Line number(s)
+2. The vulnerable code snippet
+3. Severity (Critical/High/Medium/Low)
+4. Brief explanation of why it is vulnerable (specify injection type)
+5. Suggested fix
+
+If no injection vulnerabilities are found, reply with an empty JSON array [].
+
+Output ONLY a JSON array (one entry per vulnerability):
+[{{"line":123,"code":"...","severity":"High","explanation":"...","fix":"..."}}]
+or [] if none found.
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---
