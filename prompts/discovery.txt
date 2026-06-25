@@ -1,0 +1,32 @@
+Analyze this repository structure and classify which file types are relevant
+for each OWASP Top 10 (2025) vulnerability category.
+
+Repository structure:
+{repo_structure}
+
+For each OWASP category, determine which extensions and file groups could
+contain relevant security concerns. Consider:
+- SQL injection can be in .sql, .java, .py, .m, .properties, .xml, .html
+- XSS can be in .html, .js, .jsp, .java, .xml, .properties (template strings)
+- Crypto issues can be in .java, .py, .m, .c, .properties (key references)
+- Misconfiguration can be in .yml, .yaml, .json, .properties, .xml, .conf, .plist, .env
+- Auth issues can be in .java, .py, .m, .js, .properties (session config)
+- SSRF can be in .java, .py, .m, .js, .ts (HTTP client usage)
+- Injection in general can be in .sh, .sql, .java, .py, .m, .xml
+- Logging issues in .java, .py, .m, .c, .properties, .conf
+- Data integrity in .java, .py, .m, .xml, .c
+- Access control in .java, .py, .m, .js, .ts, .html (auth guards)
+
+Respond with ONLY a JSON object mapping each OWASP category to its relevant
+extensions for THIS specific repository. Only include extensions that actually
+exist in the repo.
+
+Format:
+{{
+  "B1": [".java", ".m", ".py"],
+  "B2": [".java", ".py", ".c"],
+  "B3": [".java", ".py", ".m", ".sql", ".sh"],
+  ... (all B1 through B10)
+}}
+
+Only output valid JSON. No other text.

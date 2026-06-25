@@ -145,27 +145,25 @@ BINARY_EXTS = {
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
-def find_all_files(root: Path) -> tuple[list[Path], dict[str, list[Path]]]:
+def find_all_files(root: Path) -> tuple[list[Path], dict[str, list[Path]], dict[str, list[Path]]]:
     """
     Walk the repo and collect:
       - all non-binary files
       - files grouped by extension
       - files grouped by well-known names
-    Returns (all_files, ext_map).
+    Returns (all_files, ext_map, name_map).
     """
     all_files = []
     ext_map: dict[str, list[Path]] = {}
     name_map: dict[str, list[Path]] = {}
 
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune excluded dirs — match by directory name or relative path
+        # Prune excluded dirs — match by basename or by full relative path prefix
         rel_dir = str(Path(dirpath).relative_to(root))
         pruned = []
         for d in dirnames:
-            if d in EXCLUDE_DIRS:
-                continue
             rel = f"{rel_dir}/{d}" if rel_dir != "." else d
-            if any(rel.endswith(excl.lstrip(".")) or rel == excl for excl in EXCLUDE_DIRS):
+            if any(rel == excl or rel.startswith(excl + "/") for excl in EXCLUDE_DIRS):
                 continue
             pruned.append(d)
         dirnames[:] = pruned
@@ -179,10 +177,14 @@ def find_all_files(root: Path) -> tuple[list[Path], dict[str, list[Path]]]:
             if ext in BINARY_EXTS:
                 continue
 
-            # Check if file is likely binary
+            # Skip files we can't read
             try:
-                filepath.read_bytes()[:8192]
+                sample = filepath.read_bytes()[:8192]
             except Exception:
+                continue
+
+            # Skip files that look binary (NUL byte in first 8KB)
+            if b"\x00" in sample:
                 continue
 
             all_files.append(filepath)
@@ -192,13 +194,25 @@ def find_all_files(root: Path) -> tuple[list[Path], dict[str, list[Path]]]:
     return all_files, ext_map, name_map
 
 
-def file_key(rel_path: str, scanner_name: str) -> str:
-    """Cache key = scanner_name + file path."""
-    return hashlib.md5(f"{scanner_name}:{rel_path}".encode()).hexdigest()
+def file_key(rel_path: str, scanner_name: str, content_hash: str, prompt_hash: str) -> str:
+    """Cache key = scanner + rel path + content hash + prompt hash.
+
+    Including content and prompt hashes invalidates the cache when either
+    changes, so a modified file or an edited prompt template forces a re-scan.
+    """
+    return hashlib.md5(
+        f"{scanner_name}:{rel_path}:{content_hash}:{prompt_hash}".encode()
+    ).hexdigest()
 
 
-def ext_key(ext: str, scanner_name: str) -> str:
-    return hashlib.md5(f"ext:{scanner_name}:{ext}".encode()).hexdigest()
+def content_hash(data: bytes) -> str:
+    """Short content fingerprint used in the cache key."""
+    return hashlib.md5(data).hexdigest()[:16]
+
+
+def prompt_hash(text: str) -> str:
+    """Short prompt-template fingerprint used in the cache key."""
+    return hashlib.md5(text.encode()).hexdigest()[:16]
 
 
 def extract_json_array(raw_text: str) -> object:
@@ -216,7 +230,7 @@ def extract_json_array(raw_text: str) -> object:
         except (json.JSONDecodeError, ValueError):
             pass
 
-    if "NO_VULNERABILITIES" in text.upper() or "NO VULNERABILITIES" in text.upper():
+    if "NO_VULNERABILITIES" in text.upper():
         return []
 
     return {"error": "could not parse JSON from response", "raw_preview": text[:2000]}
@@ -285,7 +299,7 @@ def call_pi(prompt: str, session_dir: Path, timeout: int = 180) -> tuple[str, st
 
 # ── Phase 1: Discovery ──────────────────────────────────────────────────────
 
-DISCOVERY_PROMPT = """\
+DEFAULT_DISCOVERY_PROMPT = """\
 Analyze this repository structure and classify which file types are relevant
 for each OWASP Top 10 (2025) vulnerability category.
 
@@ -320,6 +334,18 @@ Format:
 Only output valid JSON. No other text."""
 
 
+def load_discovery_prompt() -> str:
+    """Load the discovery prompt template from prompts/discovery.txt.
+
+    Falls back to a built-in default if the file is missing so the script
+    still runs after a fresh checkout that only includes the scanner prompts.
+    """
+    path = PROMPTS_DIR / "discovery.txt"
+    if path.exists():
+        return path.read_text()
+    return DEFAULT_DISCOVERY_PROMPT
+
+
 def build_repo_structure(root: Path, ext_map: dict[str, list[Path]], name_map: dict[str, list[Path]]) -> str:
     """Build a concise view of the repo for the discovery prompt."""
     lines = []
@@ -345,7 +371,7 @@ def build_repo_structure(root: Path, ext_map: dict[str, list[Path]], name_map: d
             continue
         dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
         indent = "  " * (depth - 1)
-        lines.append(f"{indent}{dirpath.split('/')[-1]}/")
+        lines.append(f"{indent}{Path(dirpath).name}/")
 
     return "\n".join(lines)
 
@@ -357,6 +383,7 @@ def run_discovery(
     discovery_cache: Path,
     session_dir: Path,
     redetect: bool = False,
+    timeout: int = 240,
 ) -> dict[str, list[str]]:
     """
     Phase 1: Ask pi to classify which extensions are relevant for each
@@ -366,16 +393,19 @@ def run_discovery(
     """
     if not redetect and discovery_cache.exists():
         print("[DISCOVERY] Using cached discovery results")
-        with open(discovery_cache) as f:
-            return json.load(f)
+        try:
+            with open(discovery_cache) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[DISCOVERY] Cache unreadable ({e}); re-running discovery")
 
     print("[DISCOVERY] Analyzing repository structure...")
     repo_structure = build_repo_structure(root, ext_map, name_map)
 
-    prompt = DISCOVERY_PROMPT.format(repo_structure=repo_structure)
+    prompt = load_discovery_prompt().format(repo_structure=repo_structure)
 
     print("[DISCOVERY] Asking agent to classify file types per OWASP category...")
-    status, raw = call_pi(prompt, session_dir, timeout=240)
+    status, raw = call_pi(prompt, session_dir, timeout=timeout)
 
     if status != "ok":
         print(f"[DISCOVERY] Warning: discovery call returned {status}: {raw[:300]}")
@@ -431,10 +461,9 @@ def load_prompt_template(scanner_cfg: dict) -> str:
     prompt_path = PROMPTS_DIR / scanner_cfg["prompt_file"]
     if prompt_path.exists():
         return prompt_path.read_text()
-    # Fallback
-    return f"""\
-Analyze this source code file for {scanner_cfg["label"]} vulnerabilities.
-Look for patterns associated with {scanner_cfg["label"]} as defined in OWASP Top 10 (2025).
+    return """\
+Analyze this source code file for {label} vulnerabilities.
+Look for patterns associated with {label} as defined in OWASP Top 10 (2025).
 
 For each vulnerability found, report:
 1. Line number(s)
@@ -452,7 +481,7 @@ or [] if none found.
 --- FILE CONTENT: {{filename}} ---
 {{file_content}}
 --- END OF FILE ---
-"""
+""".replace("{label}", scanner_cfg["label"])
 
 
 def scan_file(
@@ -462,20 +491,17 @@ def scan_file(
     results_dir: Path,
     session_dir: Path,
     prompt_template: str,
+    prompt_hash_value: str,
+    timeout: int = 180,
+    force: bool = False,
 ) -> dict:
     """Scan a single file with a given scanner and cache the result."""
     rel = str(filepath.relative_to(repo_root))
-    key = file_key(rel, scanner_cfg["name"])
-    cache_file = results_dir / f"{key}.json"
-
-    if cache_file.exists():
-        print(f"[SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
-        return {"file": rel, "scanner": scanner_cfg["name"], "status": "cached"}
 
     print(f"[SCAN] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
 
     try:
-        file_content = filepath.read_text(errors="replace")
+        raw_bytes = filepath.read_bytes()
     except Exception as e:
         return {
             "file": rel,
@@ -484,12 +510,30 @@ def scan_file(
             "result": {"error": f"read_failed: {e}"},
         }
 
-    prompt = prompt_template.format(
-        filename=filepath.name,
-        file_content=file_content,
-    )
+    c_hash = content_hash(raw_bytes)
+    key = file_key(rel, scanner_cfg["name"], c_hash, prompt_hash_value)
+    cache_file = results_dir / f"{key}.json"
 
-    status, raw = call_pi(prompt, session_dir)
+    if not force and cache_file.exists():
+        print(f"[SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
+        return {"file": rel, "scanner": scanner_cfg["name"], "status": "cached"}
+
+    file_content = raw_bytes.decode("utf-8", errors="replace")
+
+    try:
+        prompt = prompt_template.format(
+            filename=filepath.name,
+            file_content=file_content,
+        )
+    except (KeyError, IndexError, ValueError) as e:
+        return {
+            "file": rel,
+            "scanner": scanner_cfg["name"],
+            "status": "error",
+            "result": {"error": f"prompt_format_failed: {e}"},
+        }
+
+    status, raw = call_pi(prompt, session_dir, timeout=timeout)
 
     if status != "ok":
         parsed = {"error": raw[:2000]}
@@ -500,10 +544,12 @@ def scan_file(
         "file": rel,
         "scanner": scanner_cfg["name"],
         "status": status,
+        "content_hash": c_hash,
+        "prompt_hash": prompt_hash_value,
+        "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "result": parsed if isinstance(parsed, (list, dict)) else {"error": "parse_error", "raw": str(parsed)[:2000]},
     }
 
-    # Write atomically
     tmp_path = cache_file.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(data))
     shutil.move(str(tmp_path), str(cache_file))
@@ -527,42 +573,53 @@ def run_scanner(
     max_files: int,
     rescan: bool,
     dry_run: bool,
+    format_override: list[str] | None = None,
+    scan_timeout: int = 180,
 ) -> tuple[dict, list[dict]]:
     """Run a single OWASP scanner across relevant files."""
     results_dir = state_dir / scanner_cfg["name"] / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get extensions from discovery (phase 1)
-    extensions = discovery_map.get(scanner_id, scanner_cfg["base_ext"])
+    if format_override:
+        extensions = list(format_override)
+    else:
+        extensions = discovery_map.get(scanner_id, scanner_cfg["base_ext"])
 
-    # Collect target files
-    target_files = []
+    target_set: set[Path] = set()
     for ext in extensions:
-        for f in ext_map.get(ext, []):
-            if f not in target_files:
-                target_files.append(f)
-
-    # Also check for named files (B6: vuln_components)
+        target_set.update(ext_map.get(ext, []))
     for fname in scanner_cfg.get("base_names", []):
-        for f in name_map.get(fname, []):
-            if f not in target_files:
-                target_files.append(f)
+        target_set.update(name_map.get(fname, []))
 
-    target_files = sorted(target_files, key=lambda p: str(p))
+    target_files = sorted(target_set, key=str)
 
-    # Filter already cached
+    # Load prompt template and hash it once for the cache key
+    prompt_template = load_prompt_template(scanner_cfg)
+    p_hash = prompt_hash(prompt_template)
+
+    # Filter to files whose content has changed since the cached result.
+    # A cache entry is valid when (a) it exists, (b) its content_hash matches
+    # the current file content, and (c) its prompt_hash matches the current
+    # prompt template. --rescan skips this check entirely.
     pending = []
     for f in target_files:
-        rel = str(f.relative_to(repo_root))
-        key = file_key(rel, scanner_cfg["name"])
-        cf = results_dir / f"{key}.json"
-        if rescan or not cf.exists():
+        if rescan:
             pending.append(f)
-
-    already_cached = len(target_files) - len(pending)
+            continue
+        try:
+            c_hash = content_hash(f.read_bytes())
+        except Exception:
+            # Unreadable now — re-scan so the new error is cached
+            pending.append(f)
+            continue
+        key = file_key(str(f.relative_to(repo_root)), scanner_cfg["name"], c_hash, p_hash)
+        if not (results_dir / f"{key}.json").exists():
+            pending.append(f)
 
     if max_files > 0 and len(pending) > max_files:
         pending = pending[:max_files]
+
+    already_cached = len(target_files) - len(pending)
 
     print(f"\n{'=' * 60}")
     print(f" Scanner: {scanner_cfg['id']} - {scanner_cfg['label']}")
@@ -579,15 +636,12 @@ def run_scanner(
         print(f"  All files cached. Use --rescan to force.")
         return scanner_cfg, []
 
-    # Load prompt template
-    prompt_template = load_prompt_template(scanner_cfg)
-
-    # Scan
     scanned = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(
-                scan_file, f, scanner_cfg, repo_root, results_dir, session_dir, prompt_template
+                scan_file, f, scanner_cfg, repo_root, results_dir, session_dir,
+                prompt_template, p_hash, scan_timeout, rescan,
             ): f
             for f in pending
         }
@@ -604,6 +658,74 @@ def run_scanner(
 
 # ── Report Generation ───────────────────────────────────────────────────────
 
+ALLOWLIST_FILENAME = "allowlist.json"
+
+SEVERITY_ORDER = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+
+
+def load_allowlist(state_dir: Path) -> list[dict]:
+    """Load the false-positive allowlist from <state_dir>/allowlist.json.
+
+    Returns an empty list if the file is missing or unreadable. Each entry is
+    a dict that may include:
+
+        scanner:  OWASP ID (e.g. "B3") or "*" for any
+        file:     relative file path or "*" for any
+        line:     line number, or null/0 to match the whole file
+        reason:   free-text justification (shown in the report)
+    """
+    path = state_dir / ALLOWLIST_FILENAME
+    if not path.exists():
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[WARN] Allowlist unreadable ({e}); ignoring", file=sys.stderr)
+        return []
+    if not isinstance(data, dict):
+        return []
+    sups = data.get("suppressions", [])
+    return [s for s in sups if isinstance(s, dict)]
+
+
+def suppression_match(scanner_id: str, rel: str, line: object, entry: dict) -> bool:
+    """True if `entry` matches the given (scanner, file, line)."""
+    s = entry.get("scanner", "*")
+    if s != "*" and s != scanner_id:
+        return False
+    f = entry.get("file", "*")
+    if f != "*" and f != rel:
+        return False
+    entry_line = entry.get("line")
+    if entry_line is None or entry_line == 0 or entry_line == "":
+        return True
+    try:
+        return int(entry_line) == int(line)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+
+
+def find_suppression(scanner_id: str, rel: str, line: object, allowlist: list[dict]) -> dict | None:
+    """Return the first matching suppression entry, or None."""
+    for entry in allowlist:
+        if suppression_match(scanner_id, rel, line, entry):
+            return entry
+    return None
+
+
+def max_severity_at_or_above(counts: dict[str, int], threshold: str) -> int:
+    """Count of findings at or above the given severity threshold.
+
+    `threshold="never"` returns 0 regardless of counts — it's the explicit
+    opt-out for `--fail-on never`.
+    """
+    cap = threshold.capitalize()
+    if cap == "Never":
+        return 0
+    order = SEVERITY_ORDER.get(cap, 0)
+    return sum(c for sev, c in counts.items() if SEVERITY_ORDER.get(sev, 0) >= order)
+
 
 def build_report(
     state_dir: Path,
@@ -611,9 +733,19 @@ def build_report(
     repo_root: Path,
     scanner_ids: list[str],
     discovery_map: dict[str, list[str]],
-) -> None:
-    """Read cached results for all scanners and produce a combined Markdown report."""
+    allowlist: list[dict] | None = None,
+) -> dict:
+    """Read cached results for all scanners and produce a combined Markdown report.
+
+    Returns a stats dict so callers (e.g. CI) can decide on an exit code without
+    re-parsing the markdown: {"severity_counts": {...}, "suppressed_count": N,
+    "error_count": N, "scanned_count": N}.
+    """
+    if allowlist is None:
+        allowlist = []
+
     severity_counts_global = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+    suppressed_count_global = 0
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = []
 
@@ -634,6 +766,7 @@ def build_report(
     global_error_count = 0
     global_clean_count = 0
     global_scanned_count = 0
+    suppressed_findings: list[dict] = []
 
     # Per-scanner sections
     for scanner_id in scanner_ids:
@@ -649,22 +782,25 @@ def build_report(
             continue
 
         sev_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+        suppressed_scanner = 0
         no_vulns = 0
         errors = 0
         files_with_vulns = []
         all_findings = []
 
         for rf in result_files:
-            with open(rf) as f:
-                data = json.load(f)
+            try:
+                with open(rf) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"[WARN] Skipping corrupt cache file {rf}: {e}", file=sys.stderr)
+                continue
 
             rel = data.get("file", "unknown")
             result_raw = data.get("result", {})
             status = data.get("status", "unknown")
             global_scanned_count += 1
 
-            if status == "cached":
-                continue  # Don't double-count cached from previous runs
             if status in ("error", "timeout"):
                 errors += 1
                 global_error_count += 1
@@ -679,19 +815,41 @@ def build_report(
 
             vulns = result_raw if isinstance(result_raw, list) else []
 
+            # Split into active and suppressed findings
+            active = []
+            for v in vulns:
+                line = v.get("line")
+                sup = find_suppression(scanner_id, rel, line, allowlist)
+                if sup is not None:
+                    suppressed_findings.append({
+                        "file": rel,
+                        "scanner": scanner_id,
+                        "vuln": v,
+                        "reason": sup.get("reason", "(no reason given)"),
+                    })
+                    suppressed_scanner += 1
+                else:
+                    active.append(v)
+
             if not vulns:
                 no_vulns += 1
                 global_clean_count += 1
             else:
-                files_with_vulns.append((rel, len(vulns)))
-                for v in vulns:
+                files_with_vulns.append((rel, len(active)))
+                for v in active:
                     sev = v.get("severity", "Unknown")
                     if sev in sev_counts:
                         sev_counts[sev] += 1
                         severity_counts_global[sev] = severity_counts_global.get(sev, 0) + 1
 
-                all_findings.append({"file": rel, "status": status, "vulns": vulns, "result": result_raw})
+                all_findings.append({
+                    "file": rel,
+                    "status": status,
+                    "vulns": active,
+                    "result": result_raw,
+                })
 
+        suppressed_count_global += suppressed_scanner
         scanner_vuln_count = sum(sev_counts.values())
         global_vuln_count += scanner_vuln_count
         files_with_vulns.sort(key=lambda x: -x[1])
@@ -709,6 +867,7 @@ def build_report(
         w(f"| High | {sev_counts['High']} |")
         w(f"| Medium | {sev_counts['Medium']} |")
         w(f"| Low | {sev_counts['Low']} |")
+        w(f"| Suppressed (allowlisted) | {suppressed_scanner} |")
         w(f"| Clean files | {no_vulns} |")
         w(f"| Errors | {errors} |")
         w()
@@ -791,9 +950,28 @@ def build_report(
     w(f"| High | {severity_counts_global['High']} |")
     w(f"| Medium | {severity_counts_global['Medium']} |")
     w(f"| Low | {severity_counts_global['Low']} |")
+    w(f"| Suppressed (allowlisted) | {suppressed_count_global} |")
     w(f"| Clean files | {global_clean_count} |")
     w(f"| Errors/timeouts | {global_error_count} |")
     w()
+
+    if suppressed_findings:
+        w("### Suppressed Findings (allowlist)")
+        w()
+        w("<details><summary>Toggle suppressed findings</summary>")
+        w()
+        w("These findings matched an entry in `.security_scan/allowlist.json` and")
+        w("are excluded from severity counts and the Overall Risk calculation.")
+        w("They remain visible here for auditability.")
+        w()
+        for sf in suppressed_findings:
+            v = sf["vuln"]
+            line_num = v.get("line", "?")
+            severity = v.get("severity", "Unknown")
+            w(f"- `{sf['scanner']}` `{sf['file']}:{line_num}` — `{severity}` — {sf['reason']}")
+        w()
+        w("</details>")
+        w()
 
     # OWASP risk matrix
     w("### Risk Heatmap")
@@ -810,7 +988,16 @@ def build_report(
     w(f"| Low      | {low} | {'🟢 LOW' if low == 0 else '⚠️ Review'} |")
     w()
 
-    overall = "🔴 CRITICAL" if crit > 0 else "🟠 HIGH" if high > 0 else "🟡 MEDIUM" if med > 0 else "🟢 LOW"
+    if crit > 0:
+        overall = "🔴 CRITICAL"
+    elif high > 0:
+        overall = "🟠 HIGH"
+    elif med > 0:
+        overall = "🟡 MEDIUM"
+    elif global_error_count > 0 or global_scanned_count == 0:
+        overall = "⚠️ INCONCLUSIVE (no signal — check errors)"
+    else:
+        overall = "🟢 LOW (clean)"
     w(f"**Overall Risk:** {overall}")
     w()
 
@@ -834,10 +1021,18 @@ def build_report(
     print(f"    High:     {severity_counts_global['High']}")
     print(f"    Medium:   {severity_counts_global['Medium']}")
     print(f"    Low:      {severity_counts_global['Low']}")
+    print(f"  Suppressed:          {suppressed_count_global}")
     print(f"  Clean files:         {global_clean_count}")
     print(f"  Errors/timeouts:     {global_error_count}")
     print()
     print(f"  Report: {output_path}")
+
+    return {
+        "severity_counts": dict(severity_counts_global),
+        "suppressed_count": suppressed_count_global,
+        "error_count": global_error_count,
+        "scanned_count": global_scanned_count,
+    }
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -880,6 +1075,30 @@ OWASP 2025 Categories:
     parser.add_argument("--dry-run", action="store_true", help="List files without scanning")
     parser.add_argument("--rescan", action="store_true", help="Re-scan all files even if cached")
     parser.add_argument("--redetect", action="store_true", help="Re-run discovery even if cached")
+    parser.add_argument(
+        "--formats",
+        default=None,
+        help="Comma-separated extensions to override the per-scanner base (e.g. '.sql,.sh')",
+    )
+    parser.add_argument(
+        "--scan-timeout",
+        type=int,
+        default=180,
+        help="Per-file pi call timeout in seconds (default: 180)",
+    )
+    parser.add_argument(
+        "--discovery-timeout",
+        type=int,
+        default=240,
+        help="Discovery pi call timeout in seconds (default: 240)",
+    )
+    parser.add_argument(
+        "--fail-on",
+        choices=["never", "low", "medium", "high", "critical"],
+        default="never",
+        help="Exit non-zero if a finding at or above this severity is found "
+             "(default: never — always exit 0)",
+    )
 
     args = parser.parse_args()
 
@@ -931,6 +1150,7 @@ OWASP 2025 Categories:
             repo_root, ext_map, name_map,
             discovery_cache, session_dir,
             redetect=args.redetect,
+            timeout=args.discovery_timeout,
         )
 
     if args.phase == 1:
@@ -940,8 +1160,12 @@ OWASP 2025 Categories:
     # ── If phase 2 only, load discovery from cache ──
     if args.phase == 2 and not discovery_map:
         if discovery_cache.exists():
-            with open(discovery_cache) as f:
-                discovery_map = json.load(f)
+            try:
+                with open(discovery_cache) as f:
+                    discovery_map = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"Discovery cache unreadable ({e}). Run with --phase 1 or --redetect first.")
+                sys.exit(1)
         else:
             print("No discovery cache found. Run with --phase 1 or no --phase flag first.")
             sys.exit(1)
@@ -954,12 +1178,18 @@ OWASP 2025 Categories:
         print("Phase 2: Scanning...")
 
     all_results = []
+    format_override = None
+    if args.formats:
+        format_override = [e if e.startswith(".") else f".{e}" for e in args.formats.split(",")]
+
     for scanner_id in scanner_ids:
         cfg = OWASP_SCANNERS[scanner_id]
         _, results = run_scanner(
             scanner_id, cfg, ext_map, name_map, discovery_map,
             repo_root, state_dir, session_dir,
             args.concurrency, args.max_files, args.rescan, args.dry_run,
+            format_override=format_override,
+            scan_timeout=args.scan_timeout,
         )
         all_results.extend(results)
 
@@ -969,7 +1199,25 @@ OWASP 2025 Categories:
         print("=" * 60)
         print(" Building report...")
         print("=" * 60)
-        build_report(state_dir, output_path, repo_root, scanner_ids, discovery_map)
+        allowlist = load_allowlist(state_dir)
+        if allowlist:
+            print(f"  Allowlist: {len(allowlist)} suppression(s) loaded")
+        stats = build_report(
+            state_dir, output_path, repo_root, scanner_ids, discovery_map, allowlist
+        )
+
+        # Exit-code logic for CI integration
+        if args.fail_on != "never":
+            triggered = max_severity_at_or_above(stats["severity_counts"], args.fail_on)
+            if triggered > 0:
+                print(f"\n[FAIL] Findings at or above '{args.fail_on}' threshold "
+                      f"({triggered}). Exiting 1.")
+                sys.exit(1)
+        if stats["error_count"] > 0:
+            print(f"\n[WARN] {stats['error_count']} file(s) errored during scan. "
+                  f"Exiting 2.")
+            sys.exit(2)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
