@@ -813,6 +813,21 @@ def build_report(
                 except (json.JSONDecodeError, TypeError):
                     pass
 
+            if isinstance(result_raw, list):
+                parsed = []
+                for item in result_raw:
+                    if isinstance(item, str):
+                        try:
+                            item = json.loads(item)
+                        except (json.JSONDecodeError, TypeError):
+                            print(f"[WARN] Dropping unparseable finding in {rel}: {item[:200]}", file=sys.stderr)
+                            continue
+                    if isinstance(item, dict):
+                        parsed.append(item)
+                    else:
+                        print(f"[WARN] Dropping non-dict finding in {rel}: {type(item).__name__}", file=sys.stderr)
+                result_raw = parsed
+
             vulns = result_raw if isinstance(result_raw, list) else []
 
             # Split into active and suppressed findings
