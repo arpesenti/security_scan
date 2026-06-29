@@ -283,11 +283,30 @@ def extract_json_object(raw_text: str) -> object:
     return {"error": "could not parse JSON from response", "raw_preview": text[:2000]}
 
 
-def call_pi(prompt: str, session_dir: Path, timeout: int = 180) -> tuple[str, str]:
+# Read-only tool allowlist used when a phase is run with tools enabled.
+# Matches the exact pattern from pi's docs example for read-only review
+# (`pi --tools read,grep,find,ls -p "Review the code"`). The model can
+# inspect the repo but cannot execute, edit, write, or fetch.
+READONLY_TOOLS = ["read", "grep", "find", "ls"]
+
+
+def call_pi(
+    prompt: str,
+    session_dir: Path,
+    timeout: int = 180,
+    tools: list[str] | None = None,
+) -> tuple[str, str]:
     """
     Call `pi -p` with the given prompt.
     Uses @file syntax to avoid ARG_MAX limits on large prompts.
     Returns (status, raw_output).
+
+    `tools` controls whether the underlying `pi` invocation gets tool use.
+    - `None` (default) preserves the historical behavior: `--no-tools` is
+      passed and the model sees only the prompt text.
+    - A non-empty list (e.g. `READONLY_TOOLS`) drops `--no-tools` and adds
+      `--tools <comma-joined>`, allowing the model to read files, search,
+      and so on within whatever allowlist the caller chose.
     """
     # Write prompt to temp file to avoid argument length limits
     tmp_fd = None
@@ -298,9 +317,18 @@ def call_pi(prompt: str, session_dir: Path, timeout: int = 180) -> tuple[str, st
         tmp_fd.write(prompt)
         tmp_fd.close()
 
+        cmd = ["pi", "--print"]
+        if tools:
+            cmd.extend(["--tools", ",".join(tools)])
+        else:
+            cmd.append("--no-tools")
+        cmd.extend([
+            "--no-session", "--mode", "text",
+            "--session-dir", str(session_dir), f"@{tmp_path}",
+        ])
+
         proc = subprocess.run(
-            ["pi", "--print", "--no-tools", "--no-session", "--mode", "text",
-             "--session-dir", str(session_dir), f"@{tmp_path}"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -412,10 +440,17 @@ def run_discovery(
     session_dir: Path,
     redetect: bool = False,
     timeout: int = 240,
+    tools: list[str] | None = None,
 ) -> dict[str, list[str]]:
     """
     Phase 1: Ask pi to classify which extensions are relevant for each
     OWASP category in this specific repo.
+
+    `tools` is forwarded to `call_pi`; pass `None` to keep the historical
+    no-tools behavior, or a list (typically `READONLY_TOOLS`) to give the
+    model the ability to inspect the repo before deciding. The cache file
+    path is the caller's responsibility — main() picks `discovery.json`
+    vs `discovery-tools.json` so the two modes don't collide.
 
     Returns {"B1": [".java", ".py"], "B2": [...], ...}
     """
@@ -433,7 +468,7 @@ def run_discovery(
     prompt = load_discovery_prompt().format(repo_structure=repo_structure)
 
     print("[DISCOVERY] Asking agent to classify file types per OWASP category...")
-    status, raw = call_pi(prompt, session_dir, timeout=timeout)
+    status, raw = call_pi(prompt, session_dir, timeout=timeout, tools=tools)
 
     if status != "ok":
         print(f"[DISCOVERY] Warning: discovery call returned {status}: {raw[:300]}")
@@ -601,12 +636,19 @@ def verify_finding(
     verify_prompt_hash_value: str,
     timeout: int = 180,
     force: bool = False,
+    tools: list[str] | None = None,
 ) -> dict:
     """Verify a single file's findings: ask the model to rate each finding's
     confidence and exploitability in the context of the file as written.
 
     Caches the per-(scanner, file) verification result; cache key invalidates
     when file content, findings list, or verify prompt changes.
+
+    `tools` is forwarded to `call_pi`. When set, the model can read related
+    files (callers, sanitizers, auth middleware) before judging each
+    finding — the cross-file judgment that makes the verify phase
+    worthwhile. The cache lives under `verify_dir`, which the caller picks
+    so tools-mode and no-tools-mode verdicts never share a path.
     """
     try:
         raw_bytes = filepath.read_bytes()
@@ -640,7 +682,7 @@ def verify_finding(
         }
 
     print(f"[VERIFY] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
-    status, raw = call_pi(prompt, session_dir, timeout=timeout)
+    status, raw = call_pi(prompt, session_dir, timeout=timeout, tools=tools)
 
     if status != "ok":
         parsed: object = {"error": raw[:2000]}
@@ -704,13 +746,23 @@ def run_verification(
     reverify: bool,
     dry_run: bool,
     verify_timeout: int = 180,
+    tools: list[str] | None = None,
 ) -> tuple[dict, list[dict]]:
     """Phase 3: Verify findings for every file that has at least one finding
     in this scanner's results dir. Files with no findings, suppressed
     findings only, or scan errors are skipped - there is nothing to verify.
+
+    When `tools` is non-empty, both the input (results dir) and the output
+    (verifications dir) live under the corresponding `-tools` sibling, so
+    the no-tools and tools-mode verdicts don't collide and can be
+    re-generated independently.
     """
-    results_dir = state_dir / scanner_cfg["name"] / "results"
-    verify_dir = state_dir / scanner_cfg["name"] / "verifications"
+    results_dir = state_dir / scanner_cfg["name"] / (
+        "results-tools" if tools else "results"
+    )
+    verify_dir = state_dir / scanner_cfg["name"] / (
+        "verifications-tools" if tools else "verifications"
+    )
     verify_dir.mkdir(parents=True, exist_ok=True)
 
     if not results_dir.exists():
@@ -750,6 +802,8 @@ def run_verification(
     print(f"\n{'=' * 60}")
     print(f" Verification: {scanner_cfg['id']} - {scanner_cfg['label']}")
     print(f"{'=' * 60}")
+    mode_label = "read-only tools" if tools else "no tools"
+    print(f"  Mode: {mode_label}")
     print(f"  Files with findings: {len(files_to_verify)}")
 
     if dry_run:
@@ -766,7 +820,7 @@ def run_verification(
             executor.submit(
                 verify_finding, fp, scanner_cfg, rel, vulns, repo_root,
                 verify_dir, session_dir, verify_template, v_prompt_hash,
-                verify_timeout, reverify,
+                verify_timeout, reverify, tools,
             ): (fp, rel)
             for fp, rel, vulns in files_to_verify
         }
@@ -833,8 +887,14 @@ def scan_file(
     prompt_hash_value: str,
     timeout: int = 180,
     force: bool = False,
+    tools: list[str] | None = None,
 ) -> dict:
-    """Scan a single file with a given scanner and cache the result."""
+    """Scan a single file with a given scanner and cache the result.
+
+    `tools` is forwarded to `call_pi`. The cache file lives under
+    `results_dir`, which the caller (run_scanner) picks so tools-mode and
+    no-tools-mode results never share a path.
+    """
     rel = str(filepath.relative_to(repo_root))
 
     print(f"[SCAN] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
@@ -872,7 +932,7 @@ def scan_file(
             "result": {"error": f"prompt_format_failed: {e}"},
         }
 
-    status, raw = call_pi(prompt, session_dir, timeout=timeout)
+    status, raw = call_pi(prompt, session_dir, timeout=timeout, tools=tools)
 
     if status != "ok":
         parsed = {"error": raw[:2000]}
@@ -914,9 +974,18 @@ def run_scanner(
     dry_run: bool,
     format_override: list[str] | None = None,
     scan_timeout: int = 180,
+    tools: list[str] | None = None,
 ) -> tuple[dict, list[dict]]:
-    """Run a single OWASP scanner across relevant files."""
-    results_dir = state_dir / scanner_cfg["name"] / "results"
+    """Run a single OWASP scanner across relevant files.
+
+    When `tools` is non-empty, results are cached under
+    `<scanner>/results-tools/` (sibling of the no-tools `results/` dir) so
+    the two modes never collide and can be toggled without invalidating
+    each other.
+    """
+    results_dir = state_dir / scanner_cfg["name"] / (
+        "results-tools" if tools else "results"
+    )
     results_dir.mkdir(parents=True, exist_ok=True)
 
     if format_override:
@@ -964,6 +1033,8 @@ def run_scanner(
     print(f" Scanner: {scanner_cfg['id']} - {scanner_cfg['label']}")
     print(f"{'=' * 60}")
     print(f"  Extensions: {', '.join(extensions)}")
+    mode_label = "read-only tools" if tools else "no tools"
+    print(f"  Mode: {mode_label}")
     print(f"  Files total: {len(target_files)} | Cached: {already_cached} | To scan: {len(pending)}")
 
     if dry_run:
@@ -980,7 +1051,7 @@ def run_scanner(
         futures = {
             executor.submit(
                 scan_file, f, scanner_cfg, repo_root, results_dir, session_dir,
-                prompt_template, p_hash, scan_timeout, rescan,
+                prompt_template, p_hash, scan_timeout, rescan, tools,
             ): f
             for f in pending
         }
@@ -1078,16 +1149,25 @@ def build_report(
     discovery_map: dict[str, list[str]],
     allowlist: list[dict] | None = None,
     confidence_threshold: str | None = None,
+    phase_tools: dict[str, bool] | None = None,
 ) -> dict:
     """Read cached results for all scanners and produce a combined Markdown report.
 
     When phase-3 verification cache files exist under
-    `<state_dir>/<scanner>/verifications/`, the report overlays each finding
-    with the verifier's confidence and exploitability verdict. The optional
+    `<state_dir>/<scanner>/verifications/` (or `verifications-tools/` when
+    `phase_tools["verify"]` is set), the report overlays each finding with
+    the verifier's confidence and exploitability verdict. The optional
     `confidence_threshold` is the minimum confidence required to count a
     finding toward the gated severity totals (and the Overall Risk line used
     for `--fail-on-confidence` gating). Findings below the threshold are still
     listed in the report, but in a separate "Needs Review" section.
+
+    `phase_tools` is a `{phase: bool}` map that tells the report which cache
+    directory variant to read from for each phase: `results/` vs
+    `results-tools/` for scan, `verifications/` vs `verifications-tools/`
+    for verify. The `discovery` key is currently informational only
+    (discovery output is loaded from `discovery.json` separately by main,
+    not here). Defaults to all-False (no tools) for backward compat.
 
     Returns a stats dict so callers (e.g. CI) can decide on an exit code without
     re-parsing the markdown: {"severity_counts": {...}, "severity_counts_gated":
@@ -1097,14 +1177,24 @@ def build_report(
     """
     if allowlist is None:
         allowlist = []
+    if phase_tools is None:
+        phase_tools = {}
+    verify_uses_tools = bool(phase_tools.get("verify", False))
+    scan_uses_tools = bool(phase_tools.get("scan", False))
 
-    # If any scanner has a verification directory, pre-load the verify prompt
-    # hash so the per-file lookup key matches what the verifier wrote.
+    # Pick the verify dir variant once; per-scanner paths below are computed
+    # by appending the scanner name to this base.
+    verify_dir_variant = "verifications-tools" if verify_uses_tools else "verifications"
+    results_dir_variant = "results-tools" if scan_uses_tools else "results"
+
+    # If any scanner has a verification directory in the chosen variant,
+    # pre-load the verify prompt hash so the per-file lookup key matches what
+    # the verifier wrote.
     verify_prompt_hash_value: str | None = None
     has_verification_data = False
     for sid in scanner_ids:
         cfg = OWASP_SCANNERS[sid]
-        if (state_dir / cfg["name"] / "verifications").exists():
+        if (state_dir / cfg["name"] / verify_dir_variant).exists():
             has_verification_data = True
             break
     if has_verification_data:
@@ -1128,6 +1218,12 @@ def build_report(
     w(f"**Date:** {now}")
     w(f"**Repository:** {repo_root}")
     w(f"**Scanners:** {', '.join(f'{OWASP_SCANNERS[sid]["label"]} ({sid})' for sid in scanner_ids)}")
+    if phase_tools:
+        def _mode(enabled: bool) -> str:
+            return f"read-only ({','.join(READONLY_TOOLS)})" if enabled else "none"
+        w(f"**Tools:** discovery={_mode(bool(phase_tools.get('discovery', False)))} · "
+          f"scan={_mode(scan_uses_tools)} · "
+          f"verify={_mode(verify_uses_tools)}")
     if has_verification_data:
         w("**Verification:** phase-3 verdicts included (see confidence per finding)")
     if confidence_threshold is not None and confidence_threshold != "never":
@@ -1144,7 +1240,7 @@ def build_report(
     for scanner_id in scanner_ids:
         cfg = OWASP_SCANNERS[scanner_id]
         scanner_name = cfg["name"]
-        results_dir = state_dir / scanner_name / "results"
+        results_dir = state_dir / scanner_name / results_dir_variant
 
         if not results_dir.exists():
             continue
@@ -1160,7 +1256,7 @@ def build_report(
         errors = 0
         files_with_vulns = []
         all_findings = []
-        scanner_verify_dir = state_dir / scanner_name / "verifications"
+        scanner_verify_dir = state_dir / scanner_name / verify_dir_variant
 
         for rf in result_files:
             try:
@@ -1317,6 +1413,8 @@ def build_report(
                 if v.get("_confidence", "Unverified") != "Unverified"
             )
             scanner_active = sum(len(e.get("vulns", [])) for e in all_findings)
+            if verify_uses_tools:
+                w(f"| Verify tools | read-only ({','.join(READONLY_TOOLS)}) |")
             w(f"| Verification coverage | {scanner_verified}/{scanner_active} |")
             w(f"| ... High confidence | {confidence_counts['High']} |")
             w(f"| ... Medium confidence | {confidence_counts['Medium']} |")
@@ -1668,6 +1766,7 @@ def build_csv_report(
     allowlist: list[dict] | None = None,
     confidence_threshold: str | None = None,
     delimiter: str = ",",
+    phase_tools: dict[str, bool] | None = None,
 ) -> dict:
     """Produce a CSV/TSV report with one row per finding, suitable for
     importing into a spreadsheet. Mirrors `build_report`'s allowlist and
@@ -1695,16 +1794,25 @@ def build_csv_report(
     has been run for that file. The function returns the same stats dict
     shape as `build_report` so the CLI's `--fail-on` / `--fail-on-confidence`
     logic can stay format-agnostic.
+
+    `phase_tools` is a `{phase: bool}` map that selects the cache dir
+    variants to read from, matching `build_report`.
     """
     import csv  # local import keeps the markdown-only path off this dep's load
 
     if allowlist is None:
         allowlist = []
+    if phase_tools is None:
+        phase_tools = {}
+    verify_uses_tools = bool(phase_tools.get("verify", False))
+    scan_uses_tools = bool(phase_tools.get("scan", False))
+    verify_dir_variant = "verifications-tools" if verify_uses_tools else "verifications"
+    results_dir_variant = "results-tools" if scan_uses_tools else "results"
 
     verify_prompt_hash_value: str | None = None
     for sid in scanner_ids:
         cfg = OWASP_SCANNERS[sid]
-        if (state_dir / cfg["name"] / "verifications").exists():
+        if (state_dir / cfg["name"] / verify_dir_variant).exists():
             verify_prompt_hash_value = prompt_hash(load_verify_prompt())
             break
 
@@ -1729,8 +1837,8 @@ def build_csv_report(
         cfg = OWASP_SCANNERS[scanner_id]
         scanner_name = cfg["name"]
         scanner_label = cfg["label"]
-        results_dir = state_dir / scanner_name / "results"
-        verify_dir = state_dir / scanner_name / "verifications"
+        results_dir = state_dir / scanner_name / results_dir_variant
+        verify_dir = state_dir / scanner_name / verify_dir_variant
 
         if not results_dir.exists():
             continue
@@ -1986,6 +2094,29 @@ OWASP 2025 Categories:
         help="Per-file verification pi call timeout in seconds (default: 180)",
     )
     parser.add_argument(
+        "--discovery-tools",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Give phase 1 (discovery) read-only tools (read,grep,find,ls). "
+             "Default: on. Disable with --no-discovery-tools.",
+    )
+    parser.add_argument(
+        "--scan-tools",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Give phase 2 (scan) read-only tools (read,grep,find,ls). "
+             "Default: off (scan is high-recall single-file; tools add cost "
+             "and prompt-injection surface). Enable with --scan-tools.",
+    )
+    parser.add_argument(
+        "--verify-tools",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Give phase 3 (verify) read-only tools (read,grep,find,ls). "
+             "Default: on. Disable with --no-verify-tools for the original "
+             "file-as-written verifier.",
+    )
+    parser.add_argument(
         "--fail-on-confidence",
         choices=["never", "low", "medium", "high"],
         default="never",
@@ -2043,7 +2174,22 @@ OWASP 2025 Categories:
                       "tsv": "security_report.tsv"}[args.report_format]
     raw_output_path = Path(args.output) if args.output else repo_root / default_output
     output_path = output_path_for_format(raw_output_path, args.report_format)
-    discovery_cache = state_dir / "discovery.json"
+    # Per-phase tools config. The default per the user is: discovery on,
+    # scan off, verify on. Each flag has a BooleanOptionalAction so the
+    # user can flip any of them with --no-<phase>-tools. The tools list
+    # (read-only) is fixed; only the per-phase on/off is user-configurable.
+    phase_tools = {
+        "discovery": bool(args.discovery_tools),
+        "scan": bool(args.scan_tools),
+        "verify": bool(args.verify_tools),
+    }
+    phase_tool_lists = {
+        phase: READONLY_TOOLS if enabled else None
+        for phase, enabled in phase_tools.items()
+    }
+    discovery_cache = state_dir / (
+        "discovery-tools.json" if phase_tools["discovery"] else "discovery.json"
+    )
     session_dir = state_dir / "sessions"
 
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -2083,6 +2229,7 @@ OWASP 2025 Categories:
             discovery_cache, session_dir,
             redetect=args.redetect,
             timeout=args.discovery_timeout,
+            tools=phase_tool_lists["discovery"],
         )
 
     if args.phase == 1:
@@ -2123,6 +2270,7 @@ OWASP 2025 Categories:
                 args.concurrency, args.max_files, args.rescan, args.dry_run,
                 format_override=format_override,
                 scan_timeout=args.scan_timeout,
+                tools=phase_tool_lists["scan"],
             )
             all_results.extend(results)
 
@@ -2130,10 +2278,15 @@ OWASP 2025 Categories:
     if run_verify and not args.dry_run:
         # For phase 3, verify even with --dry-run is a no-op (we'd be listing
         # files that may or may not have scan results yet).
+        # Look in the results dir that matches the current scan tools config,
+        # so the verifier and the scanner it judges are in lockstep.
+        results_dir_for_verify = (
+            "results-tools" if phase_tools["scan"] else "results"
+        )
         any_results = False
         for sid in scanner_ids:
             cfg = OWASP_SCANNERS[sid]
-            if (state_dir / cfg["name"] / "results").exists():
+            if (state_dir / cfg["name"] / results_dir_for_verify).exists():
                 any_results = True
                 break
         if not any_results:
@@ -2153,6 +2306,7 @@ OWASP 2025 Categories:
                     scanner_id, cfg, repo_root, state_dir, session_dir,
                     args.concurrency, args.reverify, args.dry_run,
                     verify_timeout=args.verify_timeout,
+                    tools=phase_tool_lists["verify"],
                 )
                 # Verification results are read back from disk in build_report
                 # via load_verification_for_file, so we don't need to forward
@@ -2175,6 +2329,7 @@ OWASP 2025 Categories:
             stats = build_report(
                 state_dir, output_path, repo_root, scanner_ids, discovery_map,
                 allowlist, confidence_threshold=confidence_threshold,
+                phase_tools=phase_tools,
             )
         else:
             delimiter = "\t" if args.report_format == "tsv" else ","
@@ -2182,6 +2337,7 @@ OWASP 2025 Categories:
                 state_dir, output_path, repo_root, scanner_ids, discovery_map,
                 allowlist, confidence_threshold=confidence_threshold,
                 delimiter=delimiter,
+                phase_tools=phase_tools,
             )
 
         # Exit-code logic for CI integration.

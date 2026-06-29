@@ -1050,10 +1050,13 @@ class TestVerifyCLI(unittest.TestCase):
         self.assertIn("--verify requires scan results", proc.stdout)
 
     def test_phase3_without_scan_exits_1(self):
-        # Pre-populate discovery cache so we get past the discovery check
-        # and hit the "no scan results" guard.
+        # Pre-populate the tools-mode discovery cache (the default in this
+        # build is --discovery-tools) so we get past the discovery check and
+        # hit the "no scan results" guard.
         self.state.mkdir(parents=True, exist_ok=True)
-        (self.state / "discovery.json").write_text(json.dumps({"B3": [".py"]}))
+        (self.state / "discovery-tools.json").write_text(
+            json.dumps({"B3": [".py"]})
+        )
         proc = self._run("--phase", "3", "--scanner", "B3")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("No scan results", proc.stdout)
@@ -1441,6 +1444,352 @@ class TestReportFormatCLI(unittest.TestCase):
             "--output", "out",
         )
         self.assertEqual(proc.returncode, 0)
+
+
+# ── Per-phase tool support tests ─────────────────────────────────────────────
+
+
+class TestReadonlyToolsConstant(unittest.TestCase):
+    def test_contains_expected_tools(self):
+        # The order doesn't matter for pi, but the set matters: read-only
+        # with no execution / write / fetch.
+        self.assertEqual(set(ss.READONLY_TOOLS), {"read", "grep", "find", "ls"})
+
+    def test_does_not_contain_dangerous_tools(self):
+        for dangerous in ("bash", "edit", "write"):
+            self.assertNotIn(dangerous, ss.READONLY_TOOLS)
+
+
+class TestCallPiToolArgs(unittest.TestCase):
+    """Verify the right CLI args reach pi for each tools mode."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.session = self.root / "sessions"
+        self.session.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _args_for(self, tools):
+        """Return the actual argv list that call_pi would invoke."""
+        captured = {}
+        def fake_run(cmd, *args, **kwargs):
+            captured["cmd"] = cmd
+            class R:
+                returncode = 0
+                stdout = "ok"
+                stderr = ""
+            return R()
+        with patch.object(ss.subprocess, "run", side_effect=fake_run):
+            ss.call_pi("hello", self.session, tools=tools)
+        return captured["cmd"]
+
+    def test_default_passes_no_tools(self):
+        cmd = self._args_for(tools=None)
+        self.assertIn("--no-tools", cmd)
+        self.assertNotIn("--tools", cmd)
+
+    def test_empty_list_passes_no_tools(self):
+        # An empty list is the "no tools" path, same as None
+        cmd = self._args_for(tools=[])
+        self.assertIn("--no-tools", cmd)
+        self.assertNotIn("--tools", cmd)
+
+    def test_readonly_passes_tools_flag(self):
+        cmd = self._args_for(tools=ss.READONLY_TOOLS)
+        self.assertNotIn("--no-tools", cmd)
+        idx = cmd.index("--tools")
+        self.assertEqual(cmd[idx + 1], "read,grep,find,ls")
+
+    def test_custom_list_joined_with_comma(self):
+        cmd = self._args_for(tools=["read", "grep"])
+        idx = cmd.index("--tools")
+        self.assertEqual(cmd[idx + 1], "read,grep")
+
+    def test_session_dir_preserved(self):
+        cmd = self._args_for(tools=ss.READONLY_TOOLS)
+        idx = cmd.index("--session-dir")
+        self.assertEqual(cmd[idx + 1], str(self.session))
+
+
+class TestPhaseToolsCacheRouting(unittest.TestCase):
+    """run_scanner and run_verification must route to the right cache dir
+    based on the tools flag, so tools-mode and no-tools-mode results
+    never collide and can be regenerated independently."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.sessions = self.state / "sessions"
+        self.sessions.mkdir(parents=True)
+        (self.root / "code.py").write_text("x = 1\n")
+        self.cfg = ss.OWASP_SCANNERS["B3"]
+        # Use the actual prompt hash so the cache key is stable
+        self.p_hash = ss.prompt_hash(ss.load_prompt_template(self.cfg))
+        self.discovery = {"B3": [".py"]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _seed_scan_cache(self, subdir: str, findings):
+        c_hash = ss.content_hash((self.root / "code.py").read_bytes())
+        key = ss.file_key("code.py", "injection", c_hash, self.p_hash)
+        d = self.state / "injection" / subdir
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{key}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "injection", "status": "ok",
+            "result": findings, "content_hash": c_hash,
+            "prompt_hash": self.p_hash,
+        }))
+
+    def test_scanner_no_tools_writes_to_results(self):
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")):
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                tools=None,
+            )
+        self.assertTrue((self.state / "injection" / "results").exists())
+        self.assertFalse((self.state / "injection" / "results-tools").exists())
+
+    def test_scanner_with_tools_writes_to_results_tools(self):
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")):
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                tools=ss.READONLY_TOOLS,
+            )
+        self.assertTrue((self.state / "injection" / "results-tools").exists())
+        self.assertFalse((self.state / "injection" / "results").exists())
+
+    def test_verification_no_tools_reads_results_writes_verifications(self):
+        self._seed_scan_cache("results", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))):
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                tools=None,
+            )
+        self.assertTrue((self.state / "injection" / "verifications").exists())
+        self.assertFalse((self.state / "injection" / "verifications-tools").exists())
+
+    def test_verification_with_tools_routes_to_verifications_tools(self):
+        self._seed_scan_cache("results-tools", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))):
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                tools=ss.READONLY_TOOLS,
+            )
+        self.assertTrue((self.state / "injection" / "verifications-tools").exists())
+        self.assertFalse((self.state / "injection" / "verifications").exists())
+
+    def test_scanner_forwards_tools_to_call_pi(self):
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")) as mock:
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                tools=ss.READONLY_TOOLS,
+            )
+        self.assertEqual(mock.call_count, 1)
+        self.assertEqual(mock.call_args.kwargs["tools"], ss.READONLY_TOOLS)
+
+    def test_verification_forwards_tools_to_call_pi(self):
+        # Seed in results-tools/ to match the tools-mode verifier's input dir
+        self._seed_scan_cache("results-tools", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))) as mock:
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                tools=ss.READONLY_TOOLS,
+            )
+        self.assertEqual(mock.call_count, 1)
+        self.assertEqual(mock.call_args.kwargs["tools"], ss.READONLY_TOOLS)
+
+
+class TestBuildReportToolsAnnotation(unittest.TestCase):
+    """build_report should surface the per-phase tools config in the
+    markdown so readers know whether verdicts are file-as-written or
+    cross-file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.results_dir = self.state / "injection" / "results"
+        self.results_dir.mkdir(parents=True)
+        self.output = self.root / "report.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _seed_finding(self, rel, vulns):
+        (self.results_dir / f"{rel.replace('/', '_')}.json").write_text(
+            json.dumps({
+                "file": rel, "scanner": "injection", "status": "ok",
+                "result": vulns, "content_hash": "abc",
+            })
+        )
+
+    def test_header_includes_tools_when_phase_tools_set(self):
+        self._seed_finding("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            phase_tools={"discovery": True, "scan": False, "verify": True},
+        )
+        text = self.output.read_text()
+        # All three phases should appear in the header line
+        self.assertIn("**Tools:**", text)
+        self.assertIn("discovery=read-only", text)
+        self.assertIn("scan=none", text)
+        self.assertIn("verify=read-only", text)
+        self.assertIn(",".join(ss.READONLY_TOOLS), text)
+
+    def test_header_omits_tools_line_when_phase_tools_unset(self):
+        self._seed_finding("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertNotIn("**Tools:**", self.output.read_text())
+
+    def test_per_scanner_verify_tools_row_appears_when_verify_uses_tools(self):
+        self._seed_finding("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        # Seed a verification in the tools-mode cache dir
+        vdir = self.state / "injection" / "verifications-tools"
+        vdir.mkdir(parents=True, exist_ok=True)
+        # We don't need a real verification for the row to appear, just the
+        # existence of the dir so has_verification_data becomes True
+        ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            phase_tools={"discovery": True, "scan": False, "verify": True},
+        )
+        text = self.output.read_text()
+        self.assertIn("| Verify tools | read-only", text)
+
+    def test_per_scanner_no_verify_tools_row_when_verify_off(self):
+        self._seed_finding("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            phase_tools={"discovery": True, "scan": False, "verify": False},
+        )
+        self.assertNotIn("| Verify tools |", self.output.read_text())
+
+    def test_report_reads_from_tools_results_dir_when_scan_uses_tools(self):
+        """If phase_tools["scan"] is True, the report should look in
+        results-tools/ rather than results/ for the findings to summarize."""
+        # No files in results/ but one in results-tools/
+        rd_tools = self.state / "injection" / "results-tools"
+        rd_tools.mkdir(parents=True)
+        (rd_tools / "code_py.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "injection", "status": "ok",
+            "result": [
+                {"line": 1, "severity": "High", "code": "x",
+                 "explanation": "", "fix": ""},
+            ],
+            "content_hash": "abc",
+        }))
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            phase_tools={"discovery": True, "scan": True, "verify": True},
+        )
+        self.assertEqual(stats["severity_counts"]["High"], 1)
+        # And not from the empty results/ dir
+        text = self.output.read_text()
+        self.assertIn("`code.py`", text)
+
+
+class TestToolsCLI(unittest.TestCase):
+    """Smoke tests for the three new CLI flags."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / ".security_scan"
+        (self.root / "code.py").write_text("x = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args, expect_exit=None, timeout=30):
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             *args],
+            cwd=str(self.root),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if expect_exit is not None:
+            self.assertEqual(
+                proc.returncode, expect_exit,
+                msg=f"Expected exit {expect_exit}, got {proc.returncode}\n"
+                    f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+        return proc
+
+    def test_default_discovery_tools_on(self):
+        # Without explicit flags, --discovery-tools defaults to True
+        # (so the discovery cache is discovery-tools.json)
+        self._run("--scanner", "B3", "--phase", "1", "--dry-run",
+                  "--redetect", expect_exit=0)
+        self.assertTrue((self.state / "discovery-tools.json").exists())
+        self.assertFalse((self.state / "discovery.json").exists())
+
+    def test_no_discovery_tools_uses_plain_discovery(self):
+        self._run("--scanner", "B3", "--phase", "1", "--dry-run",
+                  "--redetect", "--no-discovery-tools", expect_exit=0)
+        self.assertTrue((self.state / "discovery.json").exists())
+        self.assertFalse((self.state / "discovery-tools.json").exists())
+
+    def test_help_lists_all_three_tool_flags(self):
+        proc = self._run("--help")
+        for flag in ("--discovery-tools", "--scan-tools", "--verify-tools",
+                     "--no-discovery-tools", "--no-scan-tools",
+                     "--no-verify-tools"):
+            self.assertIn(flag, proc.stdout)
 
 
 if __name__ == "__main__":
