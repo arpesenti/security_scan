@@ -747,18 +747,25 @@ def run_verification(
     dry_run: bool,
     verify_timeout: int = 180,
     tools: list[str] | None = None,
+    scan_uses_tools: bool = False,
 ) -> tuple[dict, list[dict]]:
     """Phase 3: Verify findings for every file that has at least one finding
     in this scanner's results dir. Files with no findings, suppressed
     findings only, or scan errors are skipped - there is nothing to verify.
 
-    When `tools` is non-empty, both the input (results dir) and the output
-    (verifications dir) live under the corresponding `-tools` sibling, so
-    the no-tools and tools-mode verdicts don't collide and can be
-    re-generated independently.
+    Two independent tool flags:
+
+    - `tools` controls whether the verifier itself runs with read-only
+      tools, and where its output lives (`verifications-tools/` vs
+      `verifications/`).
+    - `scan_uses_tools` controls where the scan results to be verified
+      live (`results-tools/` vs `results/`). The verify phase must read
+      from the same dir the scan wrote to, so this is a separate flag —
+      you can run with `--scan-tools` off and `--verify-tools` on, and
+      the verifier still finds the scan output in `results/`.
     """
     results_dir = state_dir / scanner_cfg["name"] / (
-        "results-tools" if tools else "results"
+        "results-tools" if scan_uses_tools else "results"
     )
     verify_dir = state_dir / scanner_cfg["name"] / (
         "verifications-tools" if tools else "verifications"
@@ -2307,6 +2314,7 @@ OWASP 2025 Categories:
                     args.concurrency, args.reverify, args.dry_run,
                     verify_timeout=args.verify_timeout,
                     tools=phase_tool_lists["verify"],
+                    scan_uses_tools=phase_tools["scan"],
                 )
                 # Verification results are read back from disk in build_report
                 # via load_verification_for_file, so we don't need to forward

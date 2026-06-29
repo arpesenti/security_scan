@@ -1615,8 +1615,37 @@ class TestPhaseToolsCacheRouting(unittest.TestCase):
         self.assertEqual(mock.call_count, 1)
         self.assertEqual(mock.call_args.kwargs["tools"], ss.READONLY_TOOLS)
 
+    def test_verification_reads_scan_results_in_no_tools_dir(self):
+        """Regression: when scan ran without tools (results/) and verify
+        runs with tools (verifications-tools/), the verify phase must still
+        find the scan output in results/ — not look for it in results-tools/.
+
+        The bug: run_verification used its own `tools` flag to pick the
+        input dir, so verify-with-tools could never find scan results that
+        lived in results/. Coverage was 0/68109 in production."""
+        self._seed_scan_cache("results", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))) as mock:
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                tools=ss.READONLY_TOOLS,    # verify uses tools
+                scan_uses_tools=False,     # scan did not use tools
+            )
+        self.assertEqual(mock.call_count, 1)
+        # Output goes to verifications-tools/, not verifications/
+        self.assertTrue((self.state / "injection" / "verifications-tools").exists())
+        self.assertFalse((self.state / "injection" / "verifications").exists())
+
     def test_verification_forwards_tools_to_call_pi(self):
-        # Seed in results-tools/ to match the tools-mode verifier's input dir
+        # Seed in results-tools/ to match the tools-mode scan + tools-mode
+        # verify configuration. Both flags must be passed to run_verification
+        # so it knows where to read the scan results from.
         self._seed_scan_cache("results-tools", [
             {"line": 1, "severity": "High", "code": "x",
              "explanation": "", "fix": ""},
@@ -1629,6 +1658,7 @@ class TestPhaseToolsCacheRouting(unittest.TestCase):
                 "B3", self.cfg, self.root, self.state, self.sessions,
                 concurrency=1, reverify=False, dry_run=False,
                 tools=ss.READONLY_TOOLS,
+                scan_uses_tools=True,
             )
         self.assertEqual(mock.call_count, 1)
         self.assertEqual(mock.call_args.kwargs["tools"], ss.READONLY_TOOLS)
