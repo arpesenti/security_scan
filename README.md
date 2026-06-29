@@ -24,6 +24,8 @@ to rate each finding's confidence and exploitability in the context of the file 
 - Configurable per-file, discovery, and verify timeouts
 - Markdown report (`security_report.md`) with severity buckets, OWASP heatmap, per-file
   findings, verifier annotations, and a "Needs Review" bucket
+- Optional **spreadsheet-friendly reports** (`--report-format csv` or `tsv`) with one row
+  per finding for pivot-table / filter workflows
 
 ## Requirements
 
@@ -55,6 +57,9 @@ There are no Python dependencies to install.
 
 # Add the phase-3 verification pass + gate CI on High-confidence findings
 ./security_scan.py --all --verify --fail-on-confidence high
+
+# Spreadsheet-friendly report (one row per finding, opens in Excel/Sheets)
+./security_scan.py --all --report-format csv --output findings.csv
 
 # Preview which files WOULD be scanned, without calling the model
 ./security_scan.py --all --dry-run
@@ -160,6 +165,7 @@ forces a re-run.
 | `--discovery-timeout N` | `240` | Discovery `pi` call timeout in seconds. |
 | `--fail-on LEVEL` | `never` | Exit non-zero if any finding is at or above `LEVEL` (one of `low`, `medium`, `high`, `critical`). Independent of `--fail-on-confidence`. |
 | `--fail-on-confidence LEVEL` | `never` | Exit non-zero if any finding whose verifier confidence is at or above `LEVEL` is present (one of `low`, `medium`, `high`). Unverified findings are treated as below any threshold. |
+| `--report-format FMT` | `md` | Output format: `md` (human-readable markdown, default), `csv` or `tsv` (one row per finding, for spreadsheet import). The file extension on `--output` is auto-adjusted to match. |
 
 ## Cache invalidation
 
@@ -285,6 +291,47 @@ and contains:
 
 If all scans errored out, the report will say so explicitly. Check the per-scanner
 `[ERROR]`/`[TIMEOUT]` rows for the affected files.
+
+## Spreadsheet-friendly reports
+
+For pivot-table / filter workflows, pass `--report-format csv` (or `tsv`):
+
+```bash
+./security_scan.py --all --verify --report-format csv --output findings.csv
+```
+
+The output is a flat file with **one row per finding**. All the same overlays
+apply — allowlist, phase-3 verification, `--fail-on`, `--fail-on-confidence` —
+so the CSV never disagrees with the markdown about which findings are real.
+
+Columns (in order):
+
+| Column | Description |
+|--------|-------------|
+| `scanner` | OWASP ID (e.g. `B3`) |
+| `scanner_label` | Human-readable name (e.g. `Injection`) |
+| `file` | Relative path from the repo root |
+| `line` | Line number (blank when not applicable) |
+| `severity` | `Critical` / `High` / `Medium` / `Low` |
+| `code` | The vulnerable code snippet from phase 2 |
+| `explanation` | Phase 2's why |
+| `fix` | Phase 2's suggested fix |
+| `confidence` | Verifier verdict (`High` / `Medium` / `Low`), blank when no verification has run |
+| `exploitable` | Verifier verdict (`yes` / `no` / `conditional`), blank when no verification has run |
+| `verification_reason` | Verifier's one-line justification |
+| `status` | `active` (above any confidence gate), `needs_review` (below gate), `suppressed` (allowlist hit), `error` / `timeout` (per-file scan failure) |
+| `suppression_reason` | Free-text reason from the allowlist entry (suppressed rows only) |
+
+Typical filter recipes once the file is in a spreadsheet:
+
+- "Show me only things I need to act on" → filter `status` to `active` or `error`
+- "What did the verifier downgrade?" → filter `status` to `needs_review` and sort by `severity`
+- "What did we explicitly silence?" → filter `status` to `suppressed`
+- "Pivot findings by scanner" → rows = `scanner`, values = count of `status = active`
+
+`--output` is the path *stem* — the extension is auto-adjusted to `.csv` or
+`.tsv` so `--output report --report-format csv` writes `report.csv`. To get
+both formats, run twice with different `--output` paths.
 
 ## Exit codes (for CI)
 

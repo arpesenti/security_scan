@@ -1634,6 +1634,273 @@ def build_report(
     }
 
 
+# ── Tabular (CSV/TSV) report builder ────────────────────────────────────────
+
+CSV_FIELDNAMES = [
+    "scanner", "scanner_label", "file", "line", "severity",
+    "code", "explanation", "fix", "confidence", "exploitable",
+    "verification_reason", "status", "suppression_reason",
+]
+
+REPORT_FORMAT_EXTENSIONS = {"md": ".md", "csv": ".csv", "tsv": ".tsv"}
+
+
+def output_path_for_format(path: Path, report_format: str) -> Path:
+    """Return `path` with an extension that matches `report_format`.
+
+    If `path` already has the right extension, it is returned unchanged. If
+    the extension is missing or differs, it is replaced (not appended) so
+    e.g. `--output report.md --report-format csv` produces `report.csv`
+    rather than a misleading `report.md.csv`.
+    """
+    expected = REPORT_FORMAT_EXTENSIONS.get(report_format, ".md")
+    if path.suffix.lower() == expected:
+        return path
+    return path.with_suffix(expected)
+
+
+def build_csv_report(
+    state_dir: Path,
+    output_path: Path,
+    repo_root: Path,
+    scanner_ids: list[str],
+    discovery_map: dict[str, list[str]],
+    allowlist: list[dict] | None = None,
+    confidence_threshold: str | None = None,
+    delimiter: str = ",",
+) -> dict:
+    """Produce a CSV/TSV report with one row per finding, suitable for
+    importing into a spreadsheet. Mirrors `build_report`'s allowlist and
+    verification overlays but writes a flat row per finding instead of a
+    multi-section markdown document.
+
+    Columns (in order):
+
+      scanner, scanner_label, file, line, severity, code, explanation, fix,
+      confidence, exploitable, verification_reason, status,
+      suppression_reason
+
+    `status` is one of:
+
+      - "active"        = non-suppressed finding at or above the confidence
+                          threshold (or any non-suppressed finding when no
+                          threshold is set)
+      - "needs_review"  = non-suppressed finding below the confidence threshold
+                          (only emitted when a threshold is set; excluded from
+                          severity_counts_gated and Overall Risk)
+      - "suppressed"    = allowlist hit; `suppression_reason` carries the reason
+      - "error" / "timeout" = per-file scan failure (no finding data)
+
+    The `confidence` and `exploitable` columns are blank when no verification
+    has been run for that file. The function returns the same stats dict
+    shape as `build_report` so the CLI's `--fail-on` / `--fail-on-confidence`
+    logic can stay format-agnostic.
+    """
+    import csv  # local import keeps the markdown-only path off this dep's load
+
+    if allowlist is None:
+        allowlist = []
+
+    verify_prompt_hash_value: str | None = None
+    for sid in scanner_ids:
+        cfg = OWASP_SCANNERS[sid]
+        if (state_dir / cfg["name"] / "verifications").exists():
+            verify_prompt_hash_value = prompt_hash(load_verify_prompt())
+            break
+
+    has_threshold = confidence_threshold is not None and confidence_threshold != "never"
+    cutoff = (
+        CONFIDENCE_ORDER.get(confidence_threshold.capitalize(), 0)
+        if has_threshold else 0
+    )
+
+    severity_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+    confidence_counts = {"High": 0, "Medium": 0, "Low": 0, "Unverified": 0}
+    gated_severity_counts: dict[str, int] | None = (
+        {"Critical": 0, "High": 0, "Medium": 0, "Low": 0} if has_threshold else None
+    )
+    suppressed_count = 0
+    needs_review_count = 0
+    error_count = 0
+    scanned_count = 0
+    rows: list[dict] = []
+
+    for scanner_id in scanner_ids:
+        cfg = OWASP_SCANNERS[scanner_id]
+        scanner_name = cfg["name"]
+        scanner_label = cfg["label"]
+        results_dir = state_dir / scanner_name / "results"
+        verify_dir = state_dir / scanner_name / "verifications"
+
+        if not results_dir.exists():
+            continue
+
+        for rf in sorted(results_dir.glob("*.json")):
+            try:
+                with open(rf) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"[WARN] Skipping corrupt cache file {rf}: {e}", file=sys.stderr)
+                continue
+
+            rel = data.get("file", "unknown")
+            result_raw = data.get("result", {})
+            status = data.get("status", "unknown")
+            c_hash = data.get("content_hash", "")
+            scanned_count += 1
+
+            if status in ("error", "timeout"):
+                error_count += 1
+                rows.append({
+                    "scanner": scanner_id,
+                    "scanner_label": scanner_label,
+                    "file": rel,
+                    "line": "",
+                    "severity": "",
+                    "code": "",
+                    "explanation": "",
+                    "fix": "",
+                    "confidence": "",
+                    "exploitable": "",
+                    "verification_reason": "",
+                    "status": status,
+                    "suppression_reason": "",
+                })
+                continue
+
+            if isinstance(result_raw, str):
+                try:
+                    result_raw = json.loads(result_raw)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            if isinstance(result_raw, list):
+                parsed = []
+                for item in result_raw:
+                    if isinstance(item, str):
+                        try:
+                            item = json.loads(item)
+                        except (json.JSONDecodeError, TypeError):
+                            print(f"[WARN] Dropping unparseable finding in {rel}: {item[:200]}", file=sys.stderr)
+                            continue
+                    if isinstance(item, dict):
+                        parsed.append(item)
+                    else:
+                        print(f"[WARN] Dropping non-dict finding in {rel}: {type(item).__name__}", file=sys.stderr)
+                result_raw = parsed
+
+            vulns = result_raw if isinstance(result_raw, list) else []
+
+            verifications: dict[str, dict] = {}
+            if verify_prompt_hash_value is not None and vulns and c_hash:
+                verifications = load_verification_for_file(
+                    scanner_name, rel, c_hash, vulns,
+                    verify_dir, verify_prompt_hash_value,
+                ) or {}
+
+            for v in vulns:
+                raw_line = v.get("line")
+                if isinstance(raw_line, bool):
+                    line_str = ""
+                elif raw_line is None:
+                    line_str = ""
+                else:
+                    line_str = str(raw_line)
+
+                sup = find_suppression(scanner_id, rel, raw_line, allowlist)
+
+                try:
+                    line_key = str(int(raw_line))
+                except (TypeError, ValueError):
+                    line_key = ""
+                vfd = verifications.get(line_key) or {}
+                conf = vfd.get("confidence", "Unverified")
+                if conf not in CONFIDENCE_ORDER:
+                    conf = "Unverified"
+
+                base_row = {
+                    "scanner": scanner_id,
+                    "scanner_label": scanner_label,
+                    "file": rel,
+                    "line": line_str,
+                    "severity": v.get("severity", ""),
+                    "code": v.get("code", ""),
+                    "explanation": v.get("explanation", ""),
+                    "fix": v.get("fix", ""),
+                    "confidence": "" if conf == "Unverified" else conf,
+                    "exploitable": vfd.get("exploitable", ""),
+                    "verification_reason": vfd.get("verification_reason", ""),
+                }
+
+                if sup is not None:
+                    rows.append({**base_row,
+                                 "status": "suppressed",
+                                 "suppression_reason": sup.get("reason", "")})
+                    suppressed_count += 1
+                    continue
+
+                # Non-suppressed: contributes to raw severity_counts. The
+                # status column tells the user whether the row is gated in
+                # (active) or gated out (needs_review) under the current
+                # confidence threshold; severity_counts_gated below tracks
+                # only the active subset.
+                sev = v.get("severity", "")
+                is_below = CONFIDENCE_ORDER.get(conf, 0) < cutoff
+                if sev in severity_counts:
+                    severity_counts[sev] += 1
+                if has_threshold and is_below:
+                    rows.append({**base_row,
+                                 "status": "needs_review",
+                                 "suppression_reason": ""})
+                    needs_review_count += 1
+                else:
+                    rows.append({**base_row,
+                                 "status": "active",
+                                 "suppression_reason": ""})
+                    if gated_severity_counts is not None and sev in gated_severity_counts:
+                        gated_severity_counts[sev] += 1
+                confidence_counts[conf] = confidence_counts.get(conf, 0) + 1
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=CSV_FIELDNAMES, delimiter=delimiter,
+            quoting=csv.QUOTE_MINIMAL,
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    active_count = sum(1 for r in rows if r["status"] == "active")
+    needs_review_rows = sum(1 for r in rows if r["status"] == "needs_review")
+    suppressed_rows = sum(1 for r in rows if r["status"] == "suppressed")
+    error_rows = sum(1 for r in rows if r["status"] in ("error", "timeout"))
+
+    print()
+    print("=" * 60)
+    print(f" Report written ({'TSV' if delimiter == '\t' else 'CSV'})!")
+    print("=" * 60)
+    print(f"  Rows:           {len(rows)}")
+    print(f"  Active:         {active_count}")
+    print(f"  Needs review:   {needs_review_rows}")
+    print(f"  Suppressed:     {suppressed_rows}")
+    print(f"  Errors:         {error_rows}")
+    print()
+    print(f"  Report: {output_path}")
+
+    return {
+        "severity_counts": severity_counts,
+        "severity_counts_gated": gated_severity_counts,
+        "confidence_counts": confidence_counts,
+        "needs_review_count": needs_review_count,
+        "verified_count": sum(confidence_counts[k] for k in ("High", "Medium", "Low")),
+        "unverified_count": confidence_counts["Unverified"],
+        "suppressed_count": suppressed_count,
+        "error_count": error_count,
+        "scanned_count": scanned_count,
+    }
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 
@@ -1728,6 +1995,17 @@ OWASP 2025 Categories:
              "and are listed in a Needs Review section. 'never' (default) "
              "disables confidence-based gating entirely.",
     )
+    parser.add_argument(
+        "--report-format",
+        choices=["md", "csv", "tsv"],
+        default="md",
+        help="Output format for the report. 'md' (default) writes the human-"
+             "readable markdown report. 'csv' and 'tsv' write one row per "
+             "finding (active, needs_review, and suppressed) for spreadsheet "
+             "import; the file extension on --output is auto-adjusted to "
+             "match. Both formats apply the same allowlist and verification "
+             "overlays and the same --fail-on / --fail-on-confidence gates.",
+    )
 
     args = parser.parse_args()
 
@@ -1760,7 +2038,11 @@ OWASP 2025 Categories:
     # Resolve paths
     repo_root = Path.cwd()
     state_dir = Path(args.state_dir) if args.state_dir else repo_root / ".security_scan"
-    output_path = Path(args.output) if args.output else repo_root / "security_report.md"
+    default_output = {"md": "security_report.md",
+                      "csv": "security_report.csv",
+                      "tsv": "security_report.tsv"}[args.report_format]
+    raw_output_path = Path(args.output) if args.output else repo_root / default_output
+    output_path = output_path_for_format(raw_output_path, args.report_format)
     discovery_cache = state_dir / "discovery.json"
     session_dir = state_dir / "sessions"
 
@@ -1778,7 +2060,7 @@ OWASP 2025 Categories:
     print(f"Repository:  {repo_root}")
     print(f"Scanners:    {', '.join(f'{sid} ({OWASP_SCANNERS[sid]["label"]})' for sid in scanner_ids)}")
     print(f"State:       {state_dir}")
-    print(f"Output:      {output_path}")
+    print(f"Output:      {output_path} ({args.report_format.upper()})")
     print(f"Phase:       {phase_label}")
     print()
 
@@ -1881,7 +2163,7 @@ OWASP 2025 Categories:
     if not args.dry_run:
         print()
         print("=" * 60)
-        print(" Building report...")
+        print(f" Building report ({args.report_format.upper()})...")
         print("=" * 60)
         allowlist = load_allowlist(state_dir)
         if allowlist:
@@ -1889,10 +2171,18 @@ OWASP 2025 Categories:
         confidence_threshold = (
             None if args.fail_on_confidence == "never" else args.fail_on_confidence
         )
-        stats = build_report(
-            state_dir, output_path, repo_root, scanner_ids, discovery_map,
-            allowlist, confidence_threshold=confidence_threshold,
-        )
+        if args.report_format == "md":
+            stats = build_report(
+                state_dir, output_path, repo_root, scanner_ids, discovery_map,
+                allowlist, confidence_threshold=confidence_threshold,
+            )
+        else:
+            delimiter = "\t" if args.report_format == "tsv" else ","
+            stats = build_csv_report(
+                state_dir, output_path, repo_root, scanner_ids, discovery_map,
+                allowlist, confidence_threshold=confidence_threshold,
+                delimiter=delimiter,
+            )
 
         # Exit-code logic for CI integration.
         #

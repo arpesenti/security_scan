@@ -1065,5 +1065,383 @@ class TestVerifyCLI(unittest.TestCase):
         self.assertFalse(verify_dir.exists())
 
 
+# ── CSV/TSV report tests ────────────────────────────────────────────────────
+
+
+import csv  # noqa: E402
+
+from io import StringIO  # noqa: E402
+
+
+class TestOutputPathForFormat(unittest.TestCase):
+    def test_replaces_wrong_extension(self):
+        self.assertEqual(
+            ss.output_path_for_format(Path("report.md"), "csv"),
+            Path("report.csv"),
+        )
+        self.assertEqual(
+            ss.output_path_for_format(Path("report"), "tsv"),
+            Path("report.tsv"),
+        )
+
+    def test_keeps_correct_extension(self):
+        self.assertEqual(
+            ss.output_path_for_format(Path("report.csv"), "csv"),
+            Path("report.csv"),
+        )
+
+    def test_md_keeps_md(self):
+        self.assertEqual(
+            ss.output_path_for_format(Path("security_report.md"), "md"),
+            Path("security_report.md"),
+        )
+
+    def test_case_insensitive_extension_match(self):
+        self.assertEqual(
+            ss.output_path_for_format(Path("REPORT.CSV"), "csv"),
+            Path("REPORT.CSV"),
+        )
+
+
+class TestBuildCsvReport(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.results_dir = self.state / "injection" / "results"
+        self.results_dir.mkdir(parents=True)
+        self.verify_dir = self.state / "injection" / "verifications"
+        self.verify_dir.mkdir(parents=True)
+        self.output = self.root / "out.csv"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_scan(self, rel, vulns, c_hash="abc"):
+        data = {
+            "file": rel, "scanner": "injection", "status": "ok",
+            "result": vulns, "content_hash": c_hash,
+        }
+        (self.results_dir / f"{rel.replace('/', '_')}.json").write_text(
+            json.dumps(data)
+        )
+
+    def _write_verify(self, rel, c_hash, vulns, verifications):
+        vph = ss.prompt_hash(ss.load_verify_prompt())
+        f_sig = ss.findings_signature(vulns)
+        key = ss.verify_file_key(rel, "injection", c_hash, f_sig, vph)
+        (self.verify_dir / f"{key}.json").write_text(json.dumps({
+            "file": rel, "scanner": "injection", "status": "ok",
+            "verifications": verifications, "findings_signature": f_sig,
+            "verify_prompt_hash": vph, "content_hash": c_hash,
+        }))
+
+    def _read_csv(self, path):
+        with open(path, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    def test_writes_header_and_rows(self):
+        self._write_scan("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "exp", "fix": "fix"},
+        ])
+        stats = ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertTrue(self.output.exists())
+        rows = self._read_csv(self.output)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["file"], "a.py")
+        self.assertEqual(rows[0]["severity"], "High")
+        self.assertEqual(rows[0]["status"], "active")
+        self.assertEqual(rows[0]["scanner"], "B3")
+        self.assertEqual(rows[0]["scanner_label"], "Injection")
+        self.assertEqual(rows[0]["line"], "1")
+        self.assertEqual(stats["severity_counts"]["High"], 1)
+
+    def test_all_required_columns_present(self):
+        self._write_scan("a.py", [
+            {"line": 1, "severity": "Low", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        with open(self.output, encoding="utf-8") as f:
+            header = f.readline().strip().split(",")
+        for col in ss.CSV_FIELDNAMES:
+            self.assertIn(col, header, f"Missing column: {col}")
+
+    def test_suppressed_finding_marked_with_reason(self):
+        self._write_scan("a.py", [
+            {"line": 10, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        allowlist = [
+            {"scanner": "B3", "file": "a.py", "line": 10,
+             "reason": "static allowlist"},
+        ]
+        stats = ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=allowlist,
+        )
+        rows = self._read_csv(self.output)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "suppressed")
+        self.assertEqual(rows[0]["suppression_reason"], "static allowlist")
+        self.assertEqual(stats["suppressed_count"], 1)
+        self.assertEqual(stats["severity_counts"]["High"], 0)
+
+    def test_confidence_threshold_creates_needs_review(self):
+        vulns = [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+            {"line": 2, "severity": "Critical", "code": "y",
+             "explanation": "", "fix": ""},
+        ]
+        self._write_scan("a.py", vulns, c_hash="h1")
+        self._write_verify("a.py", "h1", vulns, {
+            "1": {"confidence": "Low", "exploitable": "no",
+                   "verification_reason": "dead code"},
+            "2": {"confidence": "High", "exploitable": "yes",
+                   "verification_reason": "reachable"},
+        })
+        stats = ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            confidence_threshold="high",
+        )
+        rows = self._read_csv(self.output)
+        statuses = {r["line"]: r["status"] for r in rows}
+        self.assertEqual(statuses["1"], "needs_review")
+        self.assertEqual(statuses["2"], "active")
+        # Raw counts include both; gated counts include only the active one
+        self.assertEqual(stats["severity_counts"]["High"], 1)
+        self.assertEqual(stats["severity_counts"]["Critical"], 1)
+        self.assertIsNotNone(stats["severity_counts_gated"])
+        self.assertEqual(stats["severity_counts_gated"]["High"], 0)
+        self.assertEqual(stats["severity_counts_gated"]["Critical"], 1)
+        self.assertEqual(stats["needs_review_count"], 1)
+
+    def test_no_threshold_all_active(self):
+        vulns = [
+            {"line": 1, "severity": "Medium", "code": "x",
+             "explanation": "", "fix": ""},
+        ]
+        self._write_scan("a.py", vulns, c_hash="h1")
+        self._write_verify("a.py", "h1", vulns, {
+            "1": {"confidence": "Low", "exploitable": "no",
+                   "verification_reason": ""},
+        })
+        stats = ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            confidence_threshold=None,
+        )
+        rows = self._read_csv(self.output)
+        self.assertEqual(rows[0]["status"], "active")
+        self.assertIsNone(stats["severity_counts_gated"])
+
+    def test_tsv_uses_tab_delimiter(self):
+        self._write_scan("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "has, comma", "fix": ""},
+        ])
+        tsv_out = self.root / "out.tsv"
+        ss.build_csv_report(
+            self.state, tsv_out, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[], delimiter="\t",
+        )
+        with open(tsv_out, encoding="utf-8") as f:
+            content = f.read()
+        # Header is tab-separated
+        self.assertIn("scanner\tscanner_label\tfile", content)
+        # The "has, comma" field stays in its column because of tab delimiting
+        self.assertIn("has, comma", content)
+        # Re-parse with the csv module to validate field count (str.split
+        # would lose trailing empty fields).
+        with open(tsv_out, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter="\t")
+            rows = list(reader)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows[0]), len(rows[1]))
+        self.assertEqual(len(rows[0]), len(ss.CSV_FIELDNAMES))
+
+    def test_error_file_emits_error_row(self):
+        # No findings, status is "error"
+        data = {
+            "file": "broken.py", "scanner": "injection", "status": "error",
+            "result": {"error": "read_failed"},
+        }
+        (self.results_dir / "broken.json").write_text(json.dumps(data))
+        stats = ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        rows = self._read_csv(self.output)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "error")
+        self.assertEqual(rows[0]["file"], "broken.py")
+        self.assertEqual(stats["error_count"], 1)
+
+    def test_handles_newlines_and_quotes_in_fields(self):
+        self._write_scan("a.py", [
+            {"line": 1, "severity": "High", "code": "x = 1",
+             "explanation": 'has "quotes" and\nnewlines', "fix": "fix"},
+        ])
+        ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        # Re-parse: the CSV module handles quoting/escaping per RFC 4180
+        rows = self._read_csv(self.output)
+        self.assertEqual(rows[0]["explanation"], 'has "quotes" and\nnewlines')
+
+    def test_unverified_findings_have_blank_confidence(self):
+        self._write_scan("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        # No verification cache
+        ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        rows = self._read_csv(self.output)
+        self.assertEqual(rows[0]["confidence"], "")
+        self.assertEqual(rows[0]["exploitable"], "")
+
+    def test_returns_stats_with_all_expected_keys(self):
+        self._write_scan("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        stats = ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        for key in (
+            "severity_counts", "severity_counts_gated", "confidence_counts",
+            "needs_review_count", "verified_count", "unverified_count",
+            "suppressed_count", "error_count", "scanned_count",
+        ):
+            self.assertIn(key, stats, f"Missing stats key: {key}")
+
+
+class TestReportFormatCLI(unittest.TestCase):
+    """End-to-end CLI tests for the --report-format flag."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / ".security_scan"
+        self.results_dir = self.state / "injection" / "results"
+        self.results_dir.mkdir(parents=True)
+        self.f = self.root / "code.py"
+        self.f.write_text("x = 1\n")
+        # Use the actual scanner's prompt hash so the prep cache key matches
+        # what run_scanner derives - otherwise the scanner will try to call
+        # pi and create an error cache entry, exiting 2.
+        self.p_hash = ss.prompt_hash(ss.load_prompt_template(ss.OWASP_SCANNERS["B3"]))
+        (self.state / "discovery.json").write_text(
+            json.dumps({"B3": [".py"]})
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_finding(self, rel, vulns):
+        filepath = self.root / rel
+        c_hash = ss.content_hash(filepath.read_bytes())
+        key = ss.file_key(rel, "injection", c_hash, self.p_hash)
+        data = {
+            "file": rel, "scanner": "injection", "status": "ok",
+            "result": vulns, "content_hash": c_hash,
+            "prompt_hash": self.p_hash,
+        }
+        (self.results_dir / f"{key}.json").write_text(json.dumps(data))
+
+    def _run(self, *args, expect_exit=None, timeout=30):
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             *args],
+            cwd=str(self.root),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if expect_exit is not None:
+            self.assertEqual(
+                proc.returncode, expect_exit,
+                msg=f"Expected exit {expect_exit}, got {proc.returncode}\n"
+                    f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+        return proc
+
+    def _prep_cache(self):
+        self._write_finding("code.py", [
+            {"line": 1, "severity": "High", "code": "x = 1",
+             "explanation": "e", "fix": "f"},
+        ])
+
+    def test_csv_format_writes_csv(self):
+        self._prep_cache()
+        proc = self._run(
+            "--scanner", "B3",
+            "--report-format", "csv",
+            "--output", "out",
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertTrue((self.root / "out.csv").exists())
+        # The markdown was NOT written
+        self.assertFalse((self.root / "out.md").exists())
+        with open(self.root / "out.csv", encoding="utf-8") as f:
+            first_line = f.readline()
+        self.assertTrue(first_line.startswith("scanner,scanner_label"))
+
+    def test_tsv_format_writes_tsv(self):
+        self._prep_cache()
+        proc = self._run(
+            "--scanner", "B3",
+            "--report-format", "tsv",
+            "--output", "report",
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertTrue((self.root / "report.tsv").exists())
+        with open(self.root / "report.tsv", encoding="utf-8") as f:
+            first_line = f.readline()
+        self.assertIn("\t", first_line)
+
+    def test_default_format_is_md(self):
+        self._prep_cache()
+        proc = self._run("--scanner", "B3", "--output", "r")
+        self.assertEqual(proc.returncode, 0)
+        self.assertTrue((self.root / "r.md").exists())
+
+    def test_explicit_md_extension_kept(self):
+        self._prep_cache()
+        proc = self._run(
+            "--scanner", "B3",
+            "--report-format", "md",
+            "--output", "myreport.md",
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertTrue((self.root / "myreport.md").exists())
+
+    def test_csv_format_applies_fail_on_confidence_gate(self):
+        self._prep_cache()
+        # No verification cache, so the finding is unverified. With
+        # --fail-on-confidence high, unverified findings are below the
+        # threshold, so the gate should not trip -> exit 0.
+        proc = self._run(
+            "--scanner", "B3",
+            "--report-format", "csv",
+            "--fail-on-confidence", "high",
+            "--output", "out",
+        )
+        self.assertEqual(proc.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
