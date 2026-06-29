@@ -1,9 +1,10 @@
 # security_scan
 
 OWASP Top 10 (2025) security scanner that uses [`pi -p`](https://github.com/badlogic/pi-mono) as a
-vulnerability analyst. Runs a two-phase pipeline: a discovery pass that classifies which file
-extensions in the repo matter for each OWASP category, then per-category scans that send each
-relevant file to the model for review.
+vulnerability analyst. Runs a three-phase pipeline: a discovery pass that classifies which file
+extensions in the repo matter for each OWASP category, per-category scans that send each
+relevant file to the model for review, and an optional verification pass that asks the model
+to rate each finding's confidence and exploitability in the context of the file as written.
 
 ## Features
 
@@ -11,15 +12,18 @@ relevant file to the model for review.
 - Discovery phase that narrows the scan to extensions actually present in your repo
 - Per-file result caching (`.security_scan/`) that auto-invalidates on file content or prompt
   changes — so a re-run after editing code or a prompt template picks up the new state
+- Optional **phase-3 verification** (`--verify`) that overlays a confidence + exploitability
+  verdict on every finding, with `--fail-on-confidence` to gate CI on trusted findings only
 - Concurrent scans (`--concurrency`)
 - Dry-run mode (`--dry-run`) for previewing which files would be scanned
 - Override the per-scanner extension list (`--formats`)
-- Pluggable prompt templates (`prompts/`) — both per-scanner (`b*_*.txt`) and the discovery
-  prompt (`discovery.txt`)
+- Pluggable prompt templates (`prompts/`) — per-scanner (`b*_*.txt`), the discovery prompt
+  (`discovery.txt`), and the verifier prompt (`verify_prompt.txt`)
 - False-positive allowlist (`.security_scan/allowlist.json`) with audit trail in the report
-- CI-friendly: `--fail-on <severity>` produces non-zero exits on findings or scan errors
-- Configurable per-file and discovery timeouts
-- Markdown report (`security_report.md`) with severity buckets, OWASP heatmap, and per-file findings
+- CI-friendly: `--fail-on <severity>` and `--fail-on-confidence <level>` produce non-zero exits
+- Configurable per-file, discovery, and verify timeouts
+- Markdown report (`security_report.md`) with severity buckets, OWASP heatmap, per-file
+  findings, verifier annotations, and a "Needs Review" bucket
 
 ## Requirements
 
@@ -49,6 +53,9 @@ There are no Python dependencies to install.
 # Run several scanners
 ./security_scan.py --scanner B1,B3,B7
 
+# Add the phase-3 verification pass + gate CI on High-confidence findings
+./security_scan.py --all --verify --fail-on-confidence high
+
 # Preview which files WOULD be scanned, without calling the model
 ./security_scan.py --all --dry-run
 
@@ -57,6 +64,9 @@ There are no Python dependencies to install.
 
 # Re-scan every file even if a cached result exists
 ./security_scan.py --scanner B3 --rescan
+
+# Re-run only the verification pass (after editing code or the verify prompt)
+./security_scan.py --all --verify --reverify
 
 # Limit each scanner to N files (useful for sampling)
 ./security_scan.py --scanner B3 --max-files 10
@@ -68,7 +78,7 @@ There are no Python dependencies to install.
 ./security_scan.py --all --scan-timeout 600
 ```
 
-## Two-phase workflow
+## Three-phase workflow
 
 ### Phase 1 — Discovery
 
@@ -97,24 +107,59 @@ as one JSON file per (scanner, file) under `.security_scan/<scanner>/results/`.
 - On any error or timeout, the failure is cached as `{"status": "error" | "timeout", "result": ...}`
   so a later report can show the breakdown.
 
+### Phase 3 — Verification (optional)
+
+When `--verify` is set, every file that produced at least one finding in phase 2 is sent to
+`pi` again with a single shared prompt template (`prompts/verify_prompt.txt`). The model is
+asked to look at the file as a whole and rate each finding's **confidence** (`High` / `Medium` /
+`Low`) and **exploitability** (`yes` / `no` / `conditional`), plus a one-line justification.
+The verifier is essentially a sanity check on the phase-2 scanner's output — the kinds of
+issues that trip a false positive are listed in the prompt: dead code, sanitization upstream
+in the same file, defense-in-depth wrappers, hardcoded constants mistaken for user input,
+functions only called from tests, etc.
+
+The verdict is overlaid onto the report:
+
+- Each finding shows a `Verification: ✅ High confidence, exploitable: yes — …` line under its
+  existing `Why` / `Fix` block.
+- The **Vulnerable Files** table grows a per-confidence breakdown (High / Medium / Low /
+  Unverified).
+- The **Global Summary** gains a verification-coverage row.
+- The **Risk Heatmap** and **Overall Risk** line switch to *gated* counts (only findings at
+  or above the `--fail-on-confidence` level) when a threshold is set.
+- A new **Needs Review** section lists every finding below the gate with its verifier's
+  reason, so a human can triage it (and promote confirmed false positives to the allowlist).
+
+Results are cached as one JSON file per (scanner, file) under
+`.security_scan/<scanner>/verifications/`, keyed on the file's content hash, the findings
+list's signature, and the verify-prompt hash. A re-scan that changes the findings, an edit to
+the file, or an edit to `verify_prompt.txt` all auto-invalidate the cache; `--reverify`
+forces a re-run.
+
+`--verify` composes with `--phase 3` (verify only) and `--reverify` (force re-run).
+
 ## CLI reference
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--all` | — | Run every scanner (B1–B10). |
 | `--scanner IDS` | — | Comma-separated OWASP IDs, e.g. `B1,B3,B7`. Mutually exclusive with `--all`. |
-| `--phase N` | `0` | `1` = discovery only, `2` = scan only (uses cached discovery), `0` = both. |
+| `--phase N` | `0` | `1` = discovery only, `2` = scan only (uses cached discovery), `3` = verify only (uses cached scan), `0` = all selected phases. |
 | `--concurrency N` | `4` | Max parallel `pi` calls. |
 | `--max-files N` | `0` (no limit) | Cap files per scanner (truncated after the cached filter is applied). |
 | `--output PATH` | `./security_report.md` | Report output path. |
-| `--state-dir DIR` | `./.security_scan` | Where discovery cache, per-scanner result JSONs, `allowlist.json`, and `pi` session files live. |
+| `--state-dir DIR` | `./.security_scan` | Where discovery cache, per-scanner result JSONs, verifications, `allowlist.json`, and `pi` session files live. |
 | `--dry-run` | — | Print the file list for each scanner; do not call `pi` or write reports. |
 | `--rescan` | — | Ignore cached results and re-scan every matching file. |
 | `--redetect` | — | Re-run phase 1 even if `discovery.json` is present. |
+| `--verify` | — | Run phase 3 (verify every file with findings) after phase 2. |
+| `--reverify` | — | Force re-verification of all findings, ignoring the verify cache. |
+| `--verify-timeout N` | `180` | Per-file verify `pi` call timeout in seconds. |
 | `--formats LIST` | — | Comma-separated extension override applied to every selected scanner (e.g. `.sql,.sh`). Takes precedence over discovery and `base_ext`. |
 | `--scan-timeout N` | `180` | Per-file `pi` call timeout in seconds. |
 | `--discovery-timeout N` | `240` | Discovery `pi` call timeout in seconds. |
-| `--fail-on LEVEL` | `never` | Exit non-zero if any finding is at or above `LEVEL` (one of `low`, `medium`, `high`, `critical`). |
+| `--fail-on LEVEL` | `never` | Exit non-zero if any finding is at or above `LEVEL` (one of `low`, `medium`, `high`, `critical`). Independent of `--fail-on-confidence`. |
+| `--fail-on-confidence LEVEL` | `never` | Exit non-zero if any finding whose verifier confidence is at or above `LEVEL` is present (one of `low`, `medium`, `high`). Unverified findings are treated as below any threshold. |
 
 ## Cache invalidation
 
@@ -134,7 +179,7 @@ left in place but ignored. Delete `.security_scan/` to start fresh.
 
 ## Customizing prompts
 
-Two kinds of prompts live in the `prompts/` directory:
+Three kinds of prompts live in the `prompts/` directory:
 
 - **Scanner prompts** — `prompts/bN_<name>.txt`, one per OWASP category. Two placeholders
   are substituted at scan time:
@@ -143,12 +188,23 @@ Two kinds of prompts live in the `prompts/` directory:
 - **Discovery prompt** — `prompts/discovery.txt`. Has one placeholder:
   - `{repo_structure}` — the rendered repo tree (extension counts, notable files, top-level
     directory layout) built by `build_repo_structure()`
+- **Verify prompt** — `prompts/verify_prompt.txt`. Shared across all scanners; used by
+  phase 3. Has three placeholders:
+  - `{filename}` — the basename of the file under review
+  - `{file_content}` — the full text of the file
+  - `{findings_json}` — the JSON array of phase-2 findings to verify
 
 The model is expected to reply to scanner prompts with either an empty JSON array `[]` or one
 entry per finding in this shape:
 
 ```json
 [{"line": 123, "code": "...", "severity": "High", "explanation": "...", "fix": "..."}]
+```
+
+The verify prompt expects an array (one entry per input finding) in this shape:
+
+```json
+[{"line": 123, "confidence": "High", "exploitable": "yes", "verification_reason": "..."}]
 ```
 
 To change a scanner's wording:
@@ -158,8 +214,12 @@ To change a scanner's wording:
 2. The cache is keyed on the prompt's hash, so the next run will automatically re-scan
    every file with the new prompt. No need to clear `.security_scan/` or pass `--rescan`.
 
-If a prompt file is missing, `scan_file` falls back to a generic template that still works but
-is less specific than the per-category prompts.
+To change how verification judges findings, edit `prompts/verify_prompt.txt`. The next
+`--verify` run will pick up the new wording; pass `--reverify` to force a re-run on existing
+files.
+
+If a prompt file is missing, the corresponding phase falls back to a generic built-in template
+that still works but is less specific than the on-disk one.
 
 ## False-positive allowlist
 
@@ -205,16 +265,23 @@ entry from the allowlist and re-run.
 
 ## Output report
 
-`security_report.md` is generated at the end of phase 2 and contains:
+`security_report.md` is generated at the end of phase 2 (or phase 3 when `--verify` is used)
+and contains:
 
-- A header with the timestamp, repo path, and selected scanners
+- A header with the timestamp, repo path, selected scanners, and (when applicable) a note
+  that phase-3 verification verdicts are included and a confidence gate is in effect
 - One section per scanner with: extensions scanned, file/vulnerability counts, severity
-  breakdown, suppressed count, and a list of vulnerable files
-- A `<details>` block with the full per-file findings (line number, code snippet, why, fix)
+  breakdown, suppressed count, clean count, errors, and — when verification ran — a
+  per-confidence breakdown (High / Medium / Low / Unverified) plus a needs-review count
+- A `<details>` block with the full per-file findings (line number, code snippet, why, fix,
+  and verifier annotation)
 - A **Suppressed Findings** section (collapsed) listing allowlist hits with their reasons
 - A **Global Summary** table and an OWASP risk heatmap
 - An **Overall Risk** line that is `INCONCLUSIVE` when there were zero findings but errors or
   timeouts occurred (so a green report after a flaky run is not mistaken for a clean repo)
+- A **Needs Review** section (only when verification produced below-threshold findings) that
+  lists each gated-out finding with its verifier's confidence, exploitability verdict, and
+  one-line reason
 
 If all scans errored out, the report will say so explicitly. Check the per-scanner
 `[ERROR]`/`[TIMEOUT]` rows for the affected files.
@@ -222,22 +289,34 @@ If all scans errored out, the report will say so explicitly. Check the per-scann
 ## Exit codes (for CI)
 
 ```text
-exit 0  Clean run (no findings at or above --fail-on threshold, no scan errors)
-exit 1  At least one finding is at or above --fail-on threshold
+exit 0  Clean run (no findings at or above --fail-on or --fail-on-confidence threshold, no scan errors)
+exit 1  At least one finding trips --fail-on or --fail-on-confidence
 exit 2  Scan completed but at least one file errored/timed out (no signal from it)
 ```
 
-Default is `--fail-on never` (always exit 0). For CI gating, set a threshold:
+Default is `--fail-on never` (always exit 0). For raw severity gating:
 
 ```bash
 ./security_scan.py --scanner B1,B3,B7 --fail-on high
 ```
 
+For confidence-gated gating (only count findings the verifier trusts):
+
+```bash
+./security_scan.py --scanner B1,B3,B7 --verify --fail-on-confidence high
+```
+
+`--fail-on` and `--fail-on-confidence` are independent — both can be set in the same run,
+and either gate that trips exits 1. Unverified findings are treated as below any
+`--fail-on-confidence` threshold, so running `--fail-on-confidence` without `--verify` is a
+no-op for the gate (no finding will have a confidence to compare).
+
 Inconclusive runs (exit 2) are distinct from clean runs (exit 0) so a flaky pipeline can't
 silently pass. Combine the two flags in CI scripts:
 
 ```bash
-./security_scan.py --all --fail-on high || { echo "security check failed"; exit 1; }
+./security_scan.py --all --verify --fail-on high --fail-on-confidence high \
+  || { echo "security check failed"; exit 1; }
 ```
 
 ## Excludes
@@ -279,6 +358,12 @@ top of `security_scan.py`.
   per-file cache JSONs (`status: "error"` or `status: "timeout"`). It is *not* a finding, so
   the allowlist will not help; fix the underlying scan failure (usually a pi timeout —
   raise `--scan-timeout`).
-- **Tests** — `python3 -m unittest test_security_scan.py` runs the 50+ unit tests covering
+- **`--fail-on-confidence` never trips** — every finding is being treated as unverified. You
+  need to run with `--verify` (or have run it in a prior run) so the verifier verdicts are
+  cached under `.security_scan/<scanner>/verifications/`.
+- **Stale verdicts after editing `verify_prompt.txt`** — should not happen; the verify cache
+  key includes the prompt hash. If it does, run with `--reverify` to force a re-verify.
+- **Tests** — `python3 -m unittest test_security_scan.py` runs the unit tests covering
   the non-pi behavior (cache key derivation, exclusion logic, JSON extraction, allowlist
-  matching, scan_file with mocked `pi`, CLI exit codes). No third-party dependencies required.
+  matching, scan_file + verify_finding with mocked `pi`, confidence gating, CLI exit codes).
+  No third-party dependencies required.

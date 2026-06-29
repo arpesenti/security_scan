@@ -215,6 +215,34 @@ def prompt_hash(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()[:16]
 
 
+def findings_signature(findings: list[dict]) -> str:
+    """Stable fingerprint of a findings list, used to invalidate verification
+    cache entries when the underlying scan results change.
+
+    A canonical JSON form (sorted keys, no whitespace) keeps the signature
+    stable across Python versions and dict-iteration order.
+    """
+    canonical = json.dumps(findings, sort_keys=True, separators=(",", ":"))
+    return hashlib.md5(canonical.encode()).hexdigest()[:16]
+
+
+def verify_file_key(
+    rel: str, scanner_name: str, content_hash_value: str,
+    findings_sig: str, verify_prompt_hash_value: str,
+) -> str:
+    """Cache key for a per-file verification result.
+
+    Keyed on (scanner, file path, file content hash, findings signature,
+    verify-prompt hash) so a change to any of those inputs re-runs verification.
+    The findings signature is the link that keeps verification in sync with
+    phase 2: a new vuln or a changed finding invalidates the verification.
+    """
+    return hashlib.md5(
+        f"verify:{scanner_name}:{rel}:{content_hash_value}:"
+        f"{findings_sig}:{verify_prompt_hash_value}".encode()
+    ).hexdigest()
+
+
 def extract_json_array(raw_text: str) -> object:
     """Best-effort extraction of a JSON array from model output text."""
     text = raw_text.strip()
@@ -484,6 +512,317 @@ or [] if none found.
 """.replace("{label}", scanner_cfg["label"])
 
 
+# ── Phase 3: Verification ───────────────────────────────────────────────────
+
+VERIFY_PROMPT_FILE = "verify_prompt.txt"
+
+DEFAULT_VERIFY_PROMPT = """\
+You are a senior security engineer reviewing a set of automated security findings
+to determine which are actually exploitable in the specific codebase shown below.
+
+The file under review is: {filename}
+
+Below is the full file content, followed by a list of findings that an automated
+scanner produced for this file. Your job is to evaluate each finding against the
+code as-written, considering:
+
+1. Is the vulnerable code path actually reachable from a real entry point
+   (HTTP handler, CLI argument, queue consumer, public API method, IPC)?
+2. Is the value actually tainted, or is it sanitized/validated upstream in the
+   same file (e.g. a wrapper function that pre-validates its inputs, an
+   allowlist filter, an ORM that parameterizes the underlying query)?
+3. Is the function/branch dead code, behind a feature flag that is off, called
+   only from test fixtures, or guarded by a permission check that already exists?
+4. Is the underlying issue real, or is the scanner misreading a safe pattern
+   (e.g. an internal constant mistaken for user input, a config file that is
+   never deployed, a hardcoded value that is not actually dynamic)?
+5. Could a realistic attacker craft an input that triggers this? If only under
+   unusual preconditions (admin role, specific feature flag, internal network
+   access), say so.
+
+For EACH finding in the input list, output exactly one JSON object with:
+
+  - "line": the line number (MUST match the input finding's line exactly -
+    do not change it, do not add or omit findings)
+  - "confidence": one of "High", "Medium", or "Low"
+      High   = the finding is real AND the vulnerable code is reachable AND
+               a realistic attacker could trigger it
+      Medium = the finding looks real but the entry point, sanitization, or
+               reachability is unclear from the visible code (e.g. the input
+               function is a public method but no caller is shown, or the
+               tainted value crosses a trust boundary the file does not show)
+      Low    = likely false positive - input is sanitized/validated upstream,
+               the code path is dead, the pattern is actually safe, or the
+               function is only called by tests
+  - "exploitable": one of "yes", "no", or "conditional"
+      yes         = a realistic attacker can trigger this with normal input
+      no          = cannot be triggered (dead code, sanitized, internal-only)
+      conditional = only triggers under specific preconditions (admin role,
+                    feature flag, internal-only configuration, specific build)
+  - "verification_reason": ONE OR TWO SENTENCES explaining your conclusion,
+    citing the specific upstream call / sanitization / entry point you found
+    (or stating that you could not find one).
+
+Output ONLY a JSON array (one entry per input finding, IN THE SAME ORDER as the
+input). Use exactly the line numbers from the input - do not change them.
+If a finding's line number does not match any real issue in the file, mark it
+as exploitable: "no" and confidence: "Low".
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---
+
+--- FINDINGS (from automated scan, in order) ---
+{findings_json}
+--- END OF FINDINGS ---
+"""
+
+
+def load_verify_prompt() -> str:
+    """Load the verification prompt template. Falls back to a built-in
+    default so the script still works on a fresh checkout that does not
+    include `prompts/verify_prompt.txt`.
+    """
+    path = PROMPTS_DIR / VERIFY_PROMPT_FILE
+    if path.exists():
+        return path.read_text()
+    return DEFAULT_VERIFY_PROMPT
+
+
+def verify_finding(
+    filepath: Path,
+    scanner_cfg: dict,
+    rel: str,
+    findings: list[dict],
+    repo_root: Path,
+    verify_dir: Path,
+    session_dir: Path,
+    verify_template: str,
+    verify_prompt_hash_value: str,
+    timeout: int = 180,
+    force: bool = False,
+) -> dict:
+    """Verify a single file's findings: ask the model to rate each finding's
+    confidence and exploitability in the context of the file as written.
+
+    Caches the per-(scanner, file) verification result; cache key invalidates
+    when file content, findings list, or verify prompt changes.
+    """
+    try:
+        raw_bytes = filepath.read_bytes()
+    except Exception as e:
+        return {
+            "file": rel, "scanner": scanner_cfg["name"], "status": "error",
+            "result": {"error": f"read_failed: {e}"},
+        }
+
+    c_hash = content_hash(raw_bytes)
+    f_sig = findings_signature(findings)
+    key = verify_file_key(rel, scanner_cfg["name"], c_hash, f_sig, verify_prompt_hash_value)
+    cache_file = verify_dir / f"{key}.json"
+
+    if not force and cache_file.exists():
+        print(f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
+        return {"file": rel, "scanner": scanner_cfg["name"], "status": "cached"}
+
+    file_content = raw_bytes.decode("utf-8", errors="replace")
+
+    try:
+        prompt = verify_template.format(
+            filename=filepath.name,
+            file_content=file_content,
+            findings_json=json.dumps(findings, indent=2),
+        )
+    except (KeyError, IndexError, ValueError) as e:
+        return {
+            "file": rel, "scanner": scanner_cfg["name"], "status": "error",
+            "result": {"error": f"prompt_format_failed: {e}"},
+        }
+
+    print(f"[VERIFY] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
+    status, raw = call_pi(prompt, session_dir, timeout=timeout)
+
+    if status != "ok":
+        parsed: object = {"error": raw[:2000]}
+    else:
+        parsed = extract_json_array(raw)
+
+    # Normalize the parsed response into a line-keyed map of
+    # {confidence, exploitable, verification_reason}. The scan report joins
+    # these onto its findings by line number, so the line MUST be preserved
+    # verbatim from the verifier's output.
+    verifications: dict[str, dict] = {}
+    parse_error: str | None = None
+    if isinstance(parsed, list):
+        for entry in parsed:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                line_key = str(int(entry.get("line")))
+            except (TypeError, ValueError):
+                continue
+            verifications[line_key] = {
+                "confidence": entry.get("confidence", "Unknown"),
+                "exploitable": entry.get("exploitable", "unknown"),
+                "verification_reason": entry.get("verification_reason", ""),
+            }
+    elif isinstance(parsed, dict):
+        parse_error = parsed.get("error", "parse_error")
+
+    data = {
+        "file": rel,
+        "scanner": scanner_cfg["name"],
+        "status": status,
+        "content_hash": c_hash,
+        "findings_signature": f_sig,
+        "verify_prompt_hash": verify_prompt_hash_value,
+        "verified_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "verifications": verifications,
+    }
+    if parse_error is not None:
+        data["parse_error"] = parse_error
+    if status != "ok":
+        data["error"] = raw[:2000]
+
+    tmp_path = cache_file.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(data))
+    shutil.move(str(tmp_path), str(cache_file))
+
+    if status != "ok":
+        print(f"[{status.upper()}] [VERIFY] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
+
+    return data
+
+
+def run_verification(
+    scanner_id: str,
+    scanner_cfg: dict,
+    repo_root: Path,
+    state_dir: Path,
+    session_dir: Path,
+    concurrency: int,
+    reverify: bool,
+    dry_run: bool,
+    verify_timeout: int = 180,
+) -> tuple[dict, list[dict]]:
+    """Phase 3: Verify findings for every file that has at least one finding
+    in this scanner's results dir. Files with no findings, suppressed
+    findings only, or scan errors are skipped - there is nothing to verify.
+    """
+    results_dir = state_dir / scanner_cfg["name"] / "results"
+    verify_dir = state_dir / scanner_cfg["name"] / "verifications"
+    verify_dir.mkdir(parents=True, exist_ok=True)
+
+    if not results_dir.exists():
+        return scanner_cfg, []
+
+    files_to_verify: list[tuple[Path, str, list[dict]]] = []
+    for rf in sorted(results_dir.glob("*.json")):
+        try:
+            with open(rf) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[WARN] Skipping corrupt cache file {rf}: {e}", file=sys.stderr)
+            continue
+
+        if data.get("status") in ("error", "timeout"):
+            continue
+        rel = data.get("file", "")
+        if not rel:
+            continue
+        result = data.get("result", [])
+        if not isinstance(result, list):
+            continue
+        vulns = [v for v in result if isinstance(v, dict)]
+        if not vulns:
+            continue
+
+        filepath = repo_root / rel
+        if not filepath.exists():
+            print(f"[WARN] Skipping verify of {rel}: file no longer exists", file=sys.stderr)
+            continue
+
+        files_to_verify.append((filepath, rel, vulns))
+
+    verify_template = load_verify_prompt()
+    v_prompt_hash = prompt_hash(verify_template)
+
+    print(f"\n{'=' * 60}")
+    print(f" Verification: {scanner_cfg['id']} - {scanner_cfg['label']}")
+    print(f"{'=' * 60}")
+    print(f"  Files with findings: {len(files_to_verify)}")
+
+    if dry_run:
+        for _, rel, _ in files_to_verify:
+            print(f"  {rel}")
+        return scanner_cfg, []
+
+    if not files_to_verify:
+        return scanner_cfg, []
+
+    verified: list[dict] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(
+                verify_finding, fp, scanner_cfg, rel, vulns, repo_root,
+                verify_dir, session_dir, verify_template, v_prompt_hash,
+                verify_timeout, reverify,
+            ): (fp, rel)
+            for fp, rel, vulns in files_to_verify
+        }
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                verified.append(result)
+            except Exception as e:
+                fp, rel = futures[future]
+                print(f"[ERROR] [VERIFY] [{scanner_cfg['name']}] {rel}: {e}", file=sys.stderr)
+
+    return scanner_cfg, verified
+
+
+def load_verification_for_file(
+    scanner_name: str,
+    rel: str,
+    content_hash_value: str,
+    findings: list[dict],
+    verify_dir: Path,
+    verify_prompt_hash_value: str,
+) -> dict[str, dict] | None:
+    """Look up the verification result for a (scanner, file) pair and return
+    the line-keyed verification map. Returns None when there is no usable
+    verification (no file, signature mismatch = stale, or scan failed).
+
+    Used by `build_report` to overlay confidence/exploitability onto findings
+    without having to re-run verification.
+    """
+    if not verify_dir.exists():
+        return None
+    f_sig = findings_signature(findings)
+    key = verify_file_key(
+        rel, scanner_name, content_hash_value, f_sig, verify_prompt_hash_value,
+    )
+    cache_file = verify_dir / f"{key}.json"
+    if not cache_file.exists():
+        return None
+    try:
+        with open(cache_file) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    # Defensive: ensure the cached entry was produced from the same findings
+    # list. A mismatch means the scan was re-run since verification and the
+    # old verdict is no longer trustworthy.
+    if data.get("findings_signature") != f_sig:
+        return None
+    if data.get("status") != "ok":
+        return None
+    verifications = data.get("verifications", {})
+    if not isinstance(verifications, dict):
+        return None
+    return verifications
+
+
 def scan_file(
     filepath: Path,
     scanner_cfg: dict,
@@ -662,6 +1001,10 @@ ALLOWLIST_FILENAME = "allowlist.json"
 
 SEVERITY_ORDER = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
 
+# Confidence levels assigned by the phase-3 verifier. Order is high-to-low so
+# threshold comparisons can use a single `>=` check.
+CONFIDENCE_ORDER = {"High": 3, "Medium": 2, "Low": 1, "Unverified": 0, "Unknown": 0}
+
 
 def load_allowlist(state_dir: Path) -> list[dict]:
     """Load the false-positive allowlist from <state_dir>/allowlist.json.
@@ -734,17 +1077,42 @@ def build_report(
     scanner_ids: list[str],
     discovery_map: dict[str, list[str]],
     allowlist: list[dict] | None = None,
+    confidence_threshold: str | None = None,
 ) -> dict:
     """Read cached results for all scanners and produce a combined Markdown report.
 
+    When phase-3 verification cache files exist under
+    `<state_dir>/<scanner>/verifications/`, the report overlays each finding
+    with the verifier's confidence and exploitability verdict. The optional
+    `confidence_threshold` is the minimum confidence required to count a
+    finding toward the gated severity totals (and the Overall Risk line used
+    for `--fail-on-confidence` gating). Findings below the threshold are still
+    listed in the report, but in a separate "Needs Review" section.
+
     Returns a stats dict so callers (e.g. CI) can decide on an exit code without
-    re-parsing the markdown: {"severity_counts": {...}, "suppressed_count": N,
-    "error_count": N, "scanned_count": N}.
+    re-parsing the markdown: {"severity_counts": {...}, "severity_counts_gated":
+    {...} | None, "suppressed_count": N, "error_count": N, "scanned_count": N,
+    "confidence_counts": {...}, "needs_review_count": N, "verified_count": N,
+    "unverified_count": N}.
     """
     if allowlist is None:
         allowlist = []
 
+    # If any scanner has a verification directory, pre-load the verify prompt
+    # hash so the per-file lookup key matches what the verifier wrote.
+    verify_prompt_hash_value: str | None = None
+    has_verification_data = False
+    for sid in scanner_ids:
+        cfg = OWASP_SCANNERS[sid]
+        if (state_dir / cfg["name"] / "verifications").exists():
+            has_verification_data = True
+            break
+    if has_verification_data:
+        verify_prompt_hash_value = prompt_hash(load_verify_prompt())
+
     severity_counts_global = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+    confidence_counts_global = {"High": 0, "Medium": 0, "Low": 0, "Unverified": 0}
+    needs_review_global: list[dict] = []
     suppressed_count_global = 0
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = []
@@ -760,6 +1128,10 @@ def build_report(
     w(f"**Date:** {now}")
     w(f"**Repository:** {repo_root}")
     w(f"**Scanners:** {', '.join(f'{OWASP_SCANNERS[sid]["label"]} ({sid})' for sid in scanner_ids)}")
+    if has_verification_data:
+        w("**Verification:** phase-3 verdicts included (see confidence per finding)")
+    if confidence_threshold is not None and confidence_threshold != "never":
+        w(f"**Confidence gate:** only findings with `confidence >= {confidence_threshold}` count toward severity totals and Overall Risk")
     w()
 
     global_vuln_count = 0
@@ -782,11 +1154,13 @@ def build_report(
             continue
 
         sev_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+        confidence_counts = {"High": 0, "Medium": 0, "Low": 0, "Unverified": 0}
         suppressed_scanner = 0
         no_vulns = 0
         errors = 0
         files_with_vulns = []
         all_findings = []
+        scanner_verify_dir = state_dir / scanner_name / "verifications"
 
         for rf in result_files:
             try:
@@ -799,6 +1173,7 @@ def build_report(
             rel = data.get("file", "unknown")
             result_raw = data.get("result", {})
             status = data.get("status", "unknown")
+            c_hash = data.get("content_hash", "")
             global_scanned_count += 1
 
             if status in ("error", "timeout"):
@@ -846,6 +1221,30 @@ def build_report(
                 else:
                     active.append(v)
 
+            # Overlay phase-3 verification: look up a per-(scanner, file)
+            # verdict keyed on content hash + findings signature. Missing or
+            # stale verifications leave findings as "Unverified" - they are
+            # still counted in raw severity totals but not in gated ones.
+            verifications: dict[str, dict] = {}
+            if verify_prompt_hash_value is not None and vulns and c_hash:
+                verifications = load_verification_for_file(
+                    scanner_name, rel, c_hash, vulns,
+                    scanner_verify_dir, verify_prompt_hash_value,
+                ) or {}
+
+            for v in active:
+                try:
+                    line_key = str(int(v.get("line")))
+                except (TypeError, ValueError):
+                    line_key = ""
+                vfd = verifications.get(line_key) or {}
+                conf = vfd.get("confidence", "Unverified")
+                if conf not in confidence_counts:
+                    conf = "Unverified"
+                v["_confidence"] = conf
+                v["_exploitable"] = vfd.get("exploitable", "unknown")
+                v["_verification_reason"] = vfd.get("verification_reason", "")
+
             if not vulns:
                 no_vulns += 1
                 global_clean_count += 1
@@ -856,6 +1255,9 @@ def build_report(
                     if sev in sev_counts:
                         sev_counts[sev] += 1
                         severity_counts_global[sev] = severity_counts_global.get(sev, 0) + 1
+                    conf = v.get("_confidence", "Unverified")
+                    confidence_counts[conf] = confidence_counts.get(conf, 0) + 1
+                    confidence_counts_global[conf] = confidence_counts_global.get(conf, 0) + 1
 
                 all_findings.append({
                     "file": rel,
@@ -868,6 +1270,30 @@ def build_report(
         scanner_vuln_count = sum(sev_counts.values())
         global_vuln_count += scanner_vuln_count
         files_with_vulns.sort(key=lambda x: -x[1])
+
+        # Compute per-scanner gated counts (only findings at or above the
+        # confidence threshold are kept; the rest are tracked as needs-review).
+        # Files with no verification coverage are treated as Unverified and
+        # gated out whenever a threshold is set, so an unverified repo never
+        # silently passes `--fail-on-confidence`.
+        gated_sev_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+        scanner_needs_review: list[dict] = []
+        if confidence_threshold is not None and confidence_threshold != "never":
+            cutoff = CONFIDENCE_ORDER.get(confidence_threshold.capitalize(), 0)
+            for entry in all_findings:
+                for v in entry.get("vulns", []):
+                    conf = v.get("_confidence", "Unverified")
+                    if CONFIDENCE_ORDER.get(conf, 0) >= cutoff:
+                        sev = v.get("severity", "Unknown")
+                        if sev in gated_sev_counts:
+                            gated_sev_counts[sev] += 1
+                    else:
+                        scanner_needs_review.append({
+                            "scanner": scanner_id,
+                            "file": entry["file"],
+                            "vuln": v,
+                        })
+        needs_review_global.extend(scanner_needs_review)
 
         # Section header
         w(f"## {scanner_id}: {cfg['label']}")
@@ -885,16 +1311,50 @@ def build_report(
         w(f"| Suppressed (allowlisted) | {suppressed_scanner} |")
         w(f"| Clean files | {no_vulns} |")
         w(f"| Errors | {errors} |")
+        if has_verification_data:
+            scanner_verified = sum(
+                1 for e in all_findings for v in e.get("vulns", [])
+                if v.get("_confidence", "Unverified") != "Unverified"
+            )
+            scanner_active = sum(len(e.get("vulns", [])) for e in all_findings)
+            w(f"| Verification coverage | {scanner_verified}/{scanner_active} |")
+            w(f"| ... High confidence | {confidence_counts['High']} |")
+            w(f"| ... Medium confidence | {confidence_counts['Medium']} |")
+            w(f"| ... Low confidence | {confidence_counts['Low']} |")
+            w(f"| ... Unverified | {confidence_counts['Unverified']} |")
+            if confidence_threshold is not None and confidence_threshold != "never":
+                gated_total = sum(gated_sev_counts.values())
+                w(f"| Gated by confidence >= {confidence_threshold} | {gated_total} |")
+                w(f"| Needs review (below threshold) | {len(scanner_needs_review)} |")
         w()
 
         if files_with_vulns:
             w("### Vulnerable Files")
             w()
-            w("| File | Vulnerabilities |")
-            w("|------|----------------|")
-            for rel, count in files_with_vulns[:20]:
-                w(f"| `{rel}` | {count} |")
-            w()
+            if has_verification_data:
+                w("| File | Vulnerabilities | High-conf | Medium-conf | Low-conf | Unverified |")
+                w("|------|----------------|-----------|-------------|----------|------------|")
+                for rel, _ in files_with_vulns[:20]:
+                    counts = {"High": 0, "Medium": 0, "Low": 0, "Unverified": 0}
+                    for entry in all_findings:
+                        if entry["file"] != rel:
+                            continue
+                        for v in entry.get("vulns", []):
+                            counts[v.get("_confidence", "Unverified")] = (
+                                counts.get(v.get("_confidence", "Unverified"), 0) + 1
+                            )
+                    total = sum(counts.values())
+                    w(
+                        f"| `{rel}` | {total} | {counts['High']} | "
+                        f"{counts['Medium']} | {counts['Low']} | {counts['Unverified']} |"
+                    )
+                w()
+            else:
+                w("| File | Vulnerabilities |")
+                w("|------|----------------|")
+                for rel, count in files_with_vulns[:20]:
+                    w(f"| `{rel}` | {count} |")
+                w()
 
         # Findings
         w("### Findings")
@@ -932,6 +1392,9 @@ def build_report(
                     code = v.get("code", "")
                     explanation = v.get("explanation", "")
                     fix = v.get("fix", "")
+                    conf = v.get("_confidence", "Unverified")
+                    exploitable = v.get("_exploitable", "unknown")
+                    reason = v.get("_verification_reason", "")
 
                     w(f"**#{i}** (Line {line_num}) — `{severity}`")
                     w()
@@ -945,6 +1408,19 @@ def build_report(
                         w()
                     if fix:
                         w(f"*Fix:* {fix}")
+                        w()
+                    if has_verification_data:
+                        if conf == "High":
+                            conf_glyph = "✅"
+                        elif conf == "Medium":
+                            conf_glyph = "🟡"
+                        elif conf == "Low":
+                            conf_glyph = "⚠️"
+                        else:
+                            conf_glyph = "❔"
+                        w(f"*Verification:* {conf_glyph} **{conf} confidence**, exploitable: `{exploitable}`")
+                        if reason:
+                            w(f"  — {reason}")
                         w()
                     w("---")
                     w()
@@ -968,6 +1444,18 @@ def build_report(
     w(f"| Suppressed (allowlisted) | {suppressed_count_global} |")
     w(f"| Clean files | {global_clean_count} |")
     w(f"| Errors/timeouts | {global_error_count} |")
+    if has_verification_data:
+        verified_total = (
+            confidence_counts_global['High']
+            + confidence_counts_global['Medium']
+            + confidence_counts_global['Low']
+        )
+        active_total = verified_total + confidence_counts_global['Unverified']
+        w(f"| Verification coverage | {verified_total}/{active_total} |")
+        w(f"| ... High confidence | {confidence_counts_global['High']} |")
+        w(f"| ... Medium confidence | {confidence_counts_global['Medium']} |")
+        w(f"| ... Low confidence | {confidence_counts_global['Low']} |")
+        w(f"| ... Unverified | {confidence_counts_global['Unverified']} |")
     w()
 
     if suppressed_findings:
@@ -989,14 +1477,32 @@ def build_report(
         w()
 
     # OWASP risk matrix
+    # When a confidence threshold is set, the heatmap reflects the gated
+    # counts (only findings at or above the threshold). Otherwise it shows
+    # the raw severity totals, preserving the original behavior.
+    heatmap_counts = severity_counts_global
+    if confidence_threshold is not None and confidence_threshold != "never":
+        heatmap_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+        for item in needs_review_global:
+            sev = item["vuln"].get("severity", "Unknown")
+            if sev in heatmap_counts:
+                heatmap_counts[sev] += 1
+        heatmap_counts = {
+            sev: severity_counts_global[sev] - heatmap_counts[sev]
+            for sev in heatmap_counts
+        }
     w("### Risk Heatmap")
     w()
+    if (confidence_threshold is not None and confidence_threshold != "never"):
+        w(f"*Counts reflect findings with `confidence >= {confidence_threshold}`. "
+          f"Lower-confidence findings are listed under [Needs Review](#needs-review).*")
+        w()
     w("| Severity | Count | Risk Level |")
     w("|----------|-------|------------|")
-    crit = severity_counts_global["Critical"]
-    high = severity_counts_global["High"]
-    med = severity_counts_global["Medium"]
-    low = severity_counts_global["Low"]
+    crit = heatmap_counts["Critical"]
+    high = heatmap_counts["High"]
+    med = heatmap_counts["Medium"]
+    low = heatmap_counts["Low"]
     w(f"| Critical | {crit} | {'🔴 CRITICAL' if crit > 0 else '🟢 Clear'} |")
     w(f"| High     | {high} | {'🟠 HIGH' if high > 0 else '🟢 Clear'} |")
     w(f"| Medium   | {med} | {'🟡 MEDIUM' if med > 0 else '🟢 Clear'} |")
@@ -1015,6 +1521,46 @@ def build_report(
         overall = "🟢 LOW (clean)"
     w(f"**Overall Risk:** {overall}")
     w()
+
+    # Needs Review section - only emitted when confidence-based gating is in
+    # effect, OR when a verification pass produced non-High verdicts the user
+    # should be aware of. Findings here are below the gate and are NOT counted
+    # toward severity totals or the Overall Risk line above.
+    if needs_review_global:
+        w("---")
+        w()
+        w("## Needs Review")
+        w()
+        if confidence_threshold is not None and confidence_threshold != "never":
+            w(f"The following findings are below the `{confidence_threshold}` "
+              f"confidence threshold (or are unverified). They are excluded from "
+              f"the severity counts and the Overall Risk line above. Promote them "
+              f"to the allowlist (`.security_scan/allowlist.json`) once triaged, "
+              f"or re-run with `--reverify` after addressing the underlying issue.")
+        else:
+            w("The following findings are below `High` confidence. They are still "
+              "counted in the severity totals above, but are surfaced here so a "
+              "human can triage them. Promote confirmed false positives to the "
+              "allowlist, or run with `--fail-on-confidence` to gate CI on High-"
+              "confidence findings only.")
+        w()
+        w("<details><summary>Toggle needs-review findings</summary>")
+        w()
+        for item in needs_review_global:
+            v = item["vuln"]
+            conf = v.get("_confidence", "Unverified")
+            exploitable = v.get("_exploitable", "unknown")
+            reason = v.get("_verification_reason", "")
+            scanner_label = OWASP_SCANNERS[item["scanner"]]["label"]
+            line_num = v.get("line", "?")
+            severity = v.get("severity", "Unknown")
+            w(f"- `{item['scanner']}` `{item['file']}:{line_num}` — `{severity}` — "
+              f"confidence: **{conf}**, exploitable: `{exploitable}`")
+            if reason:
+                w(f"  - _{reason}_")
+        w()
+        w("</details>")
+        w()
 
     w("---")
     w()
@@ -1039,11 +1585,49 @@ def build_report(
     print(f"  Suppressed:          {suppressed_count_global}")
     print(f"  Clean files:         {global_clean_count}")
     print(f"  Errors/timeouts:     {global_error_count}")
+    if has_verification_data:
+        verified_total = (
+            confidence_counts_global['High']
+            + confidence_counts_global['Medium']
+            + confidence_counts_global['Low']
+        )
+        active_total = verified_total + confidence_counts_global['Unverified']
+        print()
+        print("  Verification:")
+        print(f"    Coverage:        {verified_total}/{active_total}")
+        print(f"    High confidence: {confidence_counts_global['High']}")
+        print(f"    Medium:          {confidence_counts_global['Medium']}")
+        print(f"    Low:             {confidence_counts_global['Low']}")
+        print(f"    Unverified:      {confidence_counts_global['Unverified']}")
+        if confidence_threshold is not None and confidence_threshold != "never":
+            print(f"    Needs review:    {len(needs_review_global)}")
     print()
     print(f"  Report: {output_path}")
 
+    # Build gated severity counts: same totals but with findings below the
+    # confidence threshold (or unverified) removed. None when no threshold is
+    # set so callers can fall back to the raw counts.
+    gated_severity_counts: dict[str, int] | None = None
+    if confidence_threshold is not None and confidence_threshold != "never":
+        gated_severity_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+        for sev in gated_severity_counts:
+            gated_severity_counts[sev] = severity_counts_global.get(sev, 0)
+        for item in needs_review_global:
+            sev = item["vuln"].get("severity", "Unknown")
+            if sev in gated_severity_counts:
+                gated_severity_counts[sev] -= 1
+
     return {
         "severity_counts": dict(severity_counts_global),
+        "severity_counts_gated": (
+            dict(gated_severity_counts) if gated_severity_counts is not None else None
+        ),
+        "confidence_counts": dict(confidence_counts_global),
+        "needs_review_count": len(needs_review_global),
+        "verified_count": sum(
+            confidence_counts_global[k] for k in ("High", "Medium", "Low")
+        ),
+        "unverified_count": confidence_counts_global['Unverified'],
         "suppressed_count": suppressed_count_global,
         "error_count": global_error_count,
         "scanned_count": global_scanned_count,
@@ -1082,7 +1666,7 @@ OWASP 2025 Categories:
     )
     parser.add_argument("--all", action="store_true", help="Run all OWASP scanners")
     parser.add_argument("--scanner", default=None, help="Comma-separated OWASP IDs (B1,B3,B7) or --all")
-    parser.add_argument("--phase", type=int, default=0, help="Run only phase N (1=discovery, 2=scan). 0=both.")
+    parser.add_argument("--phase", type=int, default=0, help="Run only phase N (1=discovery, 2=scan, 3=verify). 0=all selected phases.")
     parser.add_argument("--concurrency", type=int, default=4, help="Max parallel scans (default: 4)")
     parser.add_argument("--max-files", type=int, default=0, help="Limit files per scanner (default: all)")
     parser.add_argument("--output", default=None, help="Report output path (default: security_report.md)")
@@ -1114,6 +1698,36 @@ OWASP 2025 Categories:
         help="Exit non-zero if a finding at or above this severity is found "
              "(default: never — always exit 0)",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Add a phase-3 verification pass: for every file with findings, "
+             "ask the model to rate each finding's confidence and "
+             "exploitability in the context of the file as written. Results "
+             "are cached and overlaid onto the report.",
+    )
+    parser.add_argument(
+        "--reverify",
+        action="store_true",
+        help="Force re-verification of all findings, ignoring the verify cache "
+             "(analogous to --rescan for phase 2).",
+    )
+    parser.add_argument(
+        "--verify-timeout",
+        type=int,
+        default=180,
+        help="Per-file verification pi call timeout in seconds (default: 180)",
+    )
+    parser.add_argument(
+        "--fail-on-confidence",
+        choices=["never", "low", "medium", "high"],
+        default="never",
+        help="Gate the exit code on findings whose verifier confidence is at "
+             "or above the given level. Findings below the threshold (or "
+             "unverified) are excluded from severity totals and Overall Risk, "
+             "and are listed in a Needs Review section. 'never' (default) "
+             "disables confidence-based gating entirely.",
+    )
 
     args = parser.parse_args()
 
@@ -1130,6 +1744,19 @@ OWASP 2025 Categories:
         print("Specify --all or --scanner B1,B3,...")
         sys.exit(1)
 
+    # Validate phase / verify flag combinations. --verify is meaningless
+    # without scan results, and --phase 3 is contradictory when explicitly
+    # disabled. Catching these up front produces a clearer error than letting
+    # the run silently no-op.
+    run_verify = bool(args.verify) or args.phase == 3
+    if args.verify and args.phase == 1:
+        print("--verify requires scan results; cannot combine with --phase 1")
+        sys.exit(1)
+    if args.phase == 3 and not args.verify:
+        # --phase 3 implies verification; the user's CLI doesn't need a
+        # separate --verify in that case, so this is just a friendly default.
+        run_verify = True
+
     # Resolve paths
     repo_root = Path.cwd()
     state_dir = Path(args.state_dir) if args.state_dir else repo_root / ".security_scan"
@@ -1140,11 +1767,19 @@ OWASP 2025 Categories:
     state_dir.mkdir(parents=True, exist_ok=True)
     session_dir.mkdir(parents=True, exist_ok=True)
 
+    phase_label = (
+        "1 (discovery)" if args.phase == 1
+        else "2 (scan)" if args.phase == 2
+        else "3 (verify)" if args.phase == 3
+        else "1+2+verify" if run_verify
+        else "1+2"
+    )
+
     print(f"Repository:  {repo_root}")
     print(f"Scanners:    {', '.join(f'{sid} ({OWASP_SCANNERS[sid]["label"]})' for sid in scanner_ids)}")
     print(f"State:       {state_dir}")
     print(f"Output:      {output_path}")
-    print(f"Phase:       {'1 (discovery)' if args.phase == 1 else '2 (scan)' if args.phase == 2 else 'both'}")
+    print(f"Phase:       {phase_label}")
     print()
 
     # ── Discover files ──
@@ -1172,8 +1807,8 @@ OWASP 2025 Categories:
         print("\nDiscovery complete. Run with --phase 2 or no --phase flag to scan.")
         return
 
-    # ── If phase 2 only, load discovery from cache ──
-    if args.phase == 2 and not discovery_map:
+    # ── If phase 2 or 3, load discovery from cache ──
+    if args.phase in (2, 3) and not discovery_map:
         if discovery_cache.exists():
             try:
                 with open(discovery_cache) as f:
@@ -1185,28 +1820,62 @@ OWASP 2025 Categories:
             print("No discovery cache found. Run with --phase 1 or no --phase flag first.")
             sys.exit(1)
 
-    # ── Phase 2: Scan ──
-    print()
-    if args.phase == 2:
-        print("Phase 2: Scanning (using cached discovery)...")
-    else:
-        print("Phase 2: Scanning...")
-
+    # ── Phase 2: Scan (skipped when --phase 3: run verification only) ──
     all_results = []
-    format_override = None
-    if args.formats:
-        format_override = [e if e.startswith(".") else f".{e}" for e in args.formats.split(",")]
+    if args.phase != 3:
+        print()
+        if args.phase == 2:
+            print("Phase 2: Scanning (using cached discovery)...")
+        else:
+            print("Phase 2: Scanning...")
 
-    for scanner_id in scanner_ids:
-        cfg = OWASP_SCANNERS[scanner_id]
-        _, results = run_scanner(
-            scanner_id, cfg, ext_map, name_map, discovery_map,
-            repo_root, state_dir, session_dir,
-            args.concurrency, args.max_files, args.rescan, args.dry_run,
-            format_override=format_override,
-            scan_timeout=args.scan_timeout,
-        )
-        all_results.extend(results)
+        format_override = None
+        if args.formats:
+            format_override = [e if e.startswith(".") else f".{e}" for e in args.formats.split(",")]
+
+        for scanner_id in scanner_ids:
+            cfg = OWASP_SCANNERS[scanner_id]
+            _, results = run_scanner(
+                scanner_id, cfg, ext_map, name_map, discovery_map,
+                repo_root, state_dir, session_dir,
+                args.concurrency, args.max_files, args.rescan, args.dry_run,
+                format_override=format_override,
+                scan_timeout=args.scan_timeout,
+            )
+            all_results.extend(results)
+
+    # ── Phase 3: Verification (only when --verify or --phase 3) ──
+    if run_verify and not args.dry_run:
+        # For phase 3, verify even with --dry-run is a no-op (we'd be listing
+        # files that may or may not have scan results yet).
+        any_results = False
+        for sid in scanner_ids:
+            cfg = OWASP_SCANNERS[sid]
+            if (state_dir / cfg["name"] / "results").exists():
+                any_results = True
+                break
+        if not any_results:
+            if args.phase == 3:
+                print("No scan results found. Run with --phase 2 (or no --phase flag) first.")
+                sys.exit(1)
+            else:
+                print("[VERIFY] No scan results yet; skipping verification pass.")
+        else:
+            print()
+            print("=" * 60)
+            print(" Phase 3: Verifying findings...")
+            print("=" * 60)
+            for scanner_id in scanner_ids:
+                cfg = OWASP_SCANNERS[scanner_id]
+                _, vresults = run_verification(
+                    scanner_id, cfg, repo_root, state_dir, session_dir,
+                    args.concurrency, args.reverify, args.dry_run,
+                    verify_timeout=args.verify_timeout,
+                )
+                # Verification results are read back from disk in build_report
+                # via load_verification_for_file, so we don't need to forward
+                # them here. The list is kept for parity with the scan loop.
+                all_results.extend(vresults)
 
     # ── Report ──
     if not args.dry_run:
@@ -1217,16 +1886,36 @@ OWASP 2025 Categories:
         allowlist = load_allowlist(state_dir)
         if allowlist:
             print(f"  Allowlist: {len(allowlist)} suppression(s) loaded")
+        confidence_threshold = (
+            None if args.fail_on_confidence == "never" else args.fail_on_confidence
+        )
         stats = build_report(
-            state_dir, output_path, repo_root, scanner_ids, discovery_map, allowlist
+            state_dir, output_path, repo_root, scanner_ids, discovery_map,
+            allowlist, confidence_threshold=confidence_threshold,
         )
 
-        # Exit-code logic for CI integration
+        # Exit-code logic for CI integration.
+        #
+        # Two independent gates can be in play:
+        #   --fail-on <sev>           -> raw severity counts
+        #   --fail-on-confidence <lvl> -> gated counts (only findings whose
+        #                                 verifier confidence is at or above
+        #                                 the level)
+        # Either gate that trips exits 1. The raw --fail-on is intentionally
+        # unchanged from the original behavior; --fail-on-confidence is the
+        # new knob for confidence-based gating.
         if args.fail_on != "never":
             triggered = max_severity_at_or_above(stats["severity_counts"], args.fail_on)
             if triggered > 0:
                 print(f"\n[FAIL] Findings at or above '{args.fail_on}' threshold "
                       f"({triggered}). Exiting 1.")
+                sys.exit(1)
+        if args.fail_on_confidence != "never":
+            gated = stats.get("severity_counts_gated") or stats["severity_counts"]
+            triggered = sum(gated.values())
+            if triggered > 0:
+                print(f"\n[FAIL] {triggered} finding(s) at or above "
+                      f"'{args.fail_on_confidence}' confidence threshold. Exiting 1.")
                 sys.exit(1)
         if stats["error_count"] > 0:
             print(f"\n[WARN] {stats['error_count']} file(s) errored during scan. "

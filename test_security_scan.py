@@ -628,5 +628,442 @@ class TestCLI(unittest.TestCase):
         self.assertNotIn("code.py", proc.stdout)
 
 
+# ── Verification phase tests ────────────────────────────────────────────────
+
+
+class TestVerificationHelpers(unittest.TestCase):
+    def test_findings_signature_is_16_hex(self):
+        sig = ss.findings_signature([{"line": 1, "severity": "High"}])
+        self.assertEqual(len(sig), 16)
+        self.assertTrue(all(c in "0123456789abcdef" for c in sig))
+
+    def test_findings_signature_stable_across_dict_order(self):
+        a = ss.findings_signature([{"line": 1, "severity": "High"}])
+        b = ss.findings_signature([{"severity": "High", "line": 1}])
+        self.assertEqual(a, b)
+
+    def test_findings_signature_changes_with_content(self):
+        a = ss.findings_signature([{"line": 1, "severity": "High"}])
+        b = ss.findings_signature([{"line": 1, "severity": "Low"}])
+        self.assertNotEqual(a, b)
+
+    def test_verify_file_key_changes_with_content(self):
+        a = ss.verify_file_key("a.py", "scanner", "chash1", "fsig", "vphash")
+        b = ss.verify_file_key("a.py", "scanner", "chash2", "fsig", "vphash")
+        self.assertNotEqual(a, b)
+
+    def test_verify_file_key_changes_with_findings_signature(self):
+        a = ss.verify_file_key("a.py", "scanner", "chash", "fsig1", "vphash")
+        b = ss.verify_file_key("a.py", "scanner", "chash", "fsig2", "vphash")
+        self.assertNotEqual(a, b)
+
+    def test_verify_file_key_changes_with_prompt(self):
+        a = ss.verify_file_key("a.py", "scanner", "chash", "fsig", "vp1")
+        b = ss.verify_file_key("a.py", "scanner", "chash", "fsig", "vp2")
+        self.assertNotEqual(a, b)
+
+    def test_verify_file_key_changes_with_scanner(self):
+        a = ss.verify_file_key("a.py", "scanner1", "chash", "fsig", "vphash")
+        b = ss.verify_file_key("a.py", "scanner2", "chash", "fsig", "vphash")
+        self.assertNotEqual(a, b)
+
+    def test_load_verify_prompt_has_placeholders(self):
+        prompt = ss.load_verify_prompt()
+        self.assertIn("{filename}", prompt)
+        self.assertIn("{file_content}", prompt)
+        self.assertIn("{findings_json}", prompt)
+
+    def test_load_verify_prompt_falls_back_to_default(self):
+        empty = Path(tempfile.mkdtemp()) / "empty_prompts"
+        empty.mkdir()
+        with patch.object(ss, "PROMPTS_DIR", empty):
+            prompt = ss.load_verify_prompt()
+        self.assertIn("{filename}", prompt)
+        self.assertIn("{findings_json}", prompt)
+
+
+class TestVerifyFindingMocked(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.verify_dir = self.state / "test" / "verifications"
+        self.verify_dir.mkdir(parents=True)
+        self.sessions = self.state / "sessions"
+        self.sessions.mkdir()
+        self.f = self.root / "code.py"
+        self.f.write_text("x = 1\n")
+        self.cfg = {
+            "name": "test", "id": "B3", "label": "Test",
+            "prompt_file": "nope.txt", "base_ext": [".py"],
+        }
+        self.findings = [
+            {"line": 1, "code": "x = 1", "severity": "High",
+             "explanation": "", "fix": ""},
+        ]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_successful_verify_writes_cache(self):
+        pi_response = json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "Reachable from CLI arg"},
+        ])
+        with patch.object(ss, "call_pi", return_value=("ok", pi_response)):
+            result = ss.verify_finding(
+                self.f, self.cfg, "code.py", self.findings,
+                self.root, self.verify_dir, self.sessions,
+                "prompt template",
+                ss.prompt_hash("prompt template"), timeout=60,
+            )
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("verifications", result)
+        cache_files = list(self.verify_dir.glob("*.json"))
+        self.assertEqual(len(cache_files), 1)
+
+    def test_cache_hit_skips_pi(self):
+        # Pre-populate the cache
+        c_hash = ss.content_hash(self.f.read_bytes())
+        f_sig = ss.findings_signature(self.findings)
+        vph = ss.prompt_hash("prompt template")
+        key = ss.verify_file_key("code.py", "test", c_hash, f_sig, vph)
+        (self.verify_dir / f"{key}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "test", "status": "ok",
+            "verifications": {"1": {"confidence": "High"}},
+            "findings_signature": f_sig, "verify_prompt_hash": vph,
+            "content_hash": c_hash,
+        }))
+        with patch.object(ss, "call_pi") as mock_pi:
+            result = ss.verify_finding(
+                self.f, self.cfg, "code.py", self.findings,
+                self.root, self.verify_dir, self.sessions,
+                "prompt template", vph, timeout=60,
+            )
+        self.assertEqual(result["status"], "cached")
+        mock_pi.assert_not_called()
+
+    def test_findings_change_invalidates_cache(self):
+        # Pre-populate cache with old findings signature
+        c_hash = ss.content_hash(self.f.read_bytes())
+        old_sig = ss.findings_signature([])
+        vph = ss.prompt_hash("prompt template")
+        key = ss.verify_file_key("code.py", "test", c_hash, old_sig, vph)
+        (self.verify_dir / f"{key}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "test", "status": "ok",
+            "verifications": {}, "findings_signature": old_sig,
+            "verify_prompt_hash": vph, "content_hash": c_hash,
+        }))
+        # New findings list -> different signature -> cache miss
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")) as mock_pi:
+            ss.verify_finding(
+                self.f, self.cfg, "code.py", self.findings,
+                self.root, self.verify_dir, self.sessions,
+                "prompt template", vph, timeout=60,
+            )
+        mock_pi.assert_called_once()
+
+    def test_malformed_response_still_writes_cache_with_error(self):
+        with patch.object(ss, "call_pi", return_value=("ok", "not json")):
+            result = ss.verify_finding(
+                self.f, self.cfg, "code.py", self.findings,
+                self.root, self.verify_dir, self.sessions,
+                "prompt template", ss.prompt_hash("prompt template"), timeout=60,
+            )
+        # Even with a parse error, cache is written so report shows it ran
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["verifications"], {})
+        self.assertIn("parse_error", result)
+
+
+class TestLoadVerificationForFile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.verify_dir = Path(self.tmp.name) / "verify"
+        self.verify_dir.mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_returns_none_when_dir_missing(self):
+        empty = Path(tempfile.mkdtemp())
+        findings = [{"line": 1, "severity": "High"}]
+        result = ss.load_verification_for_file(
+            "test", "a.py", "chash", findings,
+            empty / "nope", ss.prompt_hash("p"),
+        )
+        self.assertIsNone(result)
+
+    def test_returns_none_when_cache_file_missing(self):
+        findings = [{"line": 1, "severity": "High"}]
+        result = ss.load_verification_for_file(
+            "test", "a.py", "chash", findings,
+            self.verify_dir, ss.prompt_hash("p"),
+        )
+        self.assertIsNone(result)
+
+    def test_returns_none_on_signature_mismatch(self):
+        # Cache was written for a different findings list
+        vph = ss.prompt_hash("p")
+        old_findings = [{"line": 1, "severity": "High"}]
+        c_hash = "abc"
+        old_sig = ss.findings_signature(old_findings)
+        key = ss.verify_file_key("a.py", "test", c_hash, old_sig, vph)
+        (self.verify_dir / f"{key}.json").write_text(json.dumps({
+            "file": "a.py", "scanner": "test", "status": "ok",
+            "verifications": {"1": {"confidence": "High"}},
+            "findings_signature": old_sig, "verify_prompt_hash": vph,
+            "content_hash": c_hash,
+        }))
+        # New findings list, same key but signature inside will mismatch
+        new_findings = [{"line": 1, "severity": "Critical"}]
+        result = ss.load_verification_for_file(
+            "test", "a.py", c_hash, new_findings, self.verify_dir, vph,
+        )
+        self.assertIsNone(result)
+
+    def test_returns_none_on_status_not_ok(self):
+        vph = ss.prompt_hash("p")
+        findings = [{"line": 1, "severity": "High"}]
+        c_hash = "abc"
+        f_sig = ss.findings_signature(findings)
+        key = ss.verify_file_key("a.py", "test", c_hash, f_sig, vph)
+        (self.verify_dir / f"{key}.json").write_text(json.dumps({
+            "file": "a.py", "scanner": "test", "status": "error",
+            "verifications": {}, "findings_signature": f_sig,
+            "verify_prompt_hash": vph, "content_hash": c_hash,
+        }))
+        result = ss.load_verification_for_file(
+            "test", "a.py", c_hash, findings, self.verify_dir, vph,
+        )
+        self.assertIsNone(result)
+
+    def test_returns_verifications_on_match(self):
+        vph = ss.prompt_hash("p")
+        findings = [{"line": 1, "severity": "High"}]
+        c_hash = "abc"
+        f_sig = ss.findings_signature(findings)
+        key = ss.verify_file_key("a.py", "test", c_hash, f_sig, vph)
+        (self.verify_dir / f"{key}.json").write_text(json.dumps({
+            "file": "a.py", "scanner": "test", "status": "ok",
+            "verifications": {
+                "1": {"confidence": "High", "exploitable": "yes",
+                       "verification_reason": "reachable"},
+            },
+            "findings_signature": f_sig, "verify_prompt_hash": vph,
+            "content_hash": c_hash,
+        }))
+        result = ss.load_verification_for_file(
+            "test", "a.py", c_hash, findings, self.verify_dir, vph,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["1"]["confidence"], "High")
+        self.assertEqual(result["1"]["exploitable"], "yes")
+
+
+class TestBuildReportWithVerification(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.results_dir = self.state / "injection" / "results"
+        self.results_dir.mkdir(parents=True)
+        self.verify_dir = self.state / "injection" / "verifications"
+        self.verify_dir.mkdir(parents=True)
+        self.sessions = self.state / "sessions"
+        self.sessions.mkdir()
+        self.output = self.root / "report.md"
+        self.cfg = ss.OWASP_SCANNERS["B3"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_scan_result(self, rel, vulns):
+        c_hash = "testhash"
+        data = {
+            "file": rel, "scanner": "injection", "status": "ok",
+            "result": vulns, "content_hash": c_hash,
+        }
+        # Use the actual content hash of any bytes for realism
+        (self.results_dir / f"{rel.replace('/', '_')}.json").write_text(
+            json.dumps(data)
+        )
+        return c_hash
+
+    def _write_verification(self, rel, c_hash, findings, verifications):
+        vph = ss.prompt_hash(ss.load_verify_prompt())
+        f_sig = ss.findings_signature(findings)
+        key = ss.verify_file_key(rel, "injection", c_hash, f_sig, vph)
+        (self.verify_dir / f"{key}.json").write_text(json.dumps({
+            "file": rel, "scanner": "injection", "status": "ok",
+            "verifications": verifications, "findings_signature": f_sig,
+            "verify_prompt_hash": vph, "content_hash": c_hash,
+        }))
+
+    def test_unverified_findings_marked_unverified(self):
+        vulns = [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ]
+        self._write_scan_result("a.py", vulns)
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertEqual(stats["confidence_counts"]["Unverified"], 1)
+        self.assertEqual(stats["verified_count"], 0)
+        # No confidence threshold => no gated counts
+        self.assertIsNone(stats["severity_counts_gated"])
+        text = self.output.read_text()
+        self.assertIn("Unverified", text)
+
+    def test_verification_annotates_findings(self):
+        vulns = [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+            {"line": 2, "severity": "Low", "code": "y",
+             "explanation": "", "fix": ""},
+        ]
+        c_hash = self._write_scan_result("a.py", vulns)
+        self._write_verification("a.py", c_hash, vulns, {
+            "1": {"confidence": "High", "exploitable": "yes",
+                   "verification_reason": "reachable from main"},
+            "2": {"confidence": "Low", "exploitable": "no",
+                   "verification_reason": "sanitized upstream"},
+        })
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertEqual(stats["confidence_counts"]["High"], 1)
+        self.assertEqual(stats["confidence_counts"]["Low"], 1)
+        self.assertEqual(stats["verified_count"], 2)
+        self.assertEqual(stats["unverified_count"], 0)
+        text = self.output.read_text()
+        self.assertIn("High confidence", text)
+        self.assertIn("reachable from main", text)
+        self.assertIn("sanitized upstream", text)
+
+    def test_confidence_threshold_gates_severity_counts(self):
+        vulns = [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+            {"line": 2, "severity": "Critical", "code": "y",
+             "explanation": "", "fix": ""},
+        ]
+        c_hash = self._write_scan_result("a.py", vulns)
+        self._write_verification("a.py", c_hash, vulns, {
+            "1": {"confidence": "Low", "exploitable": "no",
+                   "verification_reason": "dead code"},
+            "2": {"confidence": "High", "exploitable": "yes",
+                   "verification_reason": "reachable"},
+        })
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            confidence_threshold="high",
+        )
+        # Raw counts include both
+        self.assertEqual(stats["severity_counts"]["High"], 1)
+        self.assertEqual(stats["severity_counts"]["Critical"], 1)
+        # Gated counts: only the High-confidence Critical survives
+        self.assertIsNotNone(stats["severity_counts_gated"])
+        self.assertEqual(stats["severity_counts_gated"]["Critical"], 1)
+        self.assertEqual(stats["severity_counts_gated"]["High"], 0)
+        # One finding below threshold
+        self.assertEqual(stats["needs_review_count"], 1)
+        text = self.output.read_text()
+        self.assertIn("Needs Review", text)
+        self.assertIn("dead code", text)
+
+    def test_confidence_threshold_unverified_counted_as_below(self):
+        # Unverified findings are below any threshold, so they end up in
+        # needs-review when a threshold is set.
+        vulns = [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ]
+        self._write_scan_result("a.py", vulns)  # no verification
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            confidence_threshold="high",
+        )
+        self.assertEqual(stats["unverified_count"], 1)
+        self.assertEqual(stats["needs_review_count"], 1)
+        self.assertEqual(stats["severity_counts_gated"]["High"], 0)
+
+    def test_no_threshold_keeps_raw_behavior(self):
+        vulns = [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ]
+        c_hash = self._write_scan_result("a.py", vulns)
+        self._write_verification("a.py", c_hash, vulns, {
+            "1": {"confidence": "Low", "exploitable": "no",
+                   "verification_reason": "sanitized"},
+        })
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            confidence_threshold=None,
+        )
+        # Without a threshold, gated counts are not computed
+        self.assertIsNone(stats["severity_counts_gated"])
+        # Raw counts include the finding
+        self.assertEqual(stats["severity_counts"]["High"], 1)
+        # No needs-review without a threshold
+        self.assertEqual(stats["needs_review_count"], 0)
+
+
+class TestVerifyCLI(unittest.TestCase):
+    """Smoke tests for the new CLI flags."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / ".security_scan"
+        (self.root / "code.py").write_text("x = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args, expect_exit=None, timeout=30):
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             *args],
+            cwd=str(self.root),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if expect_exit is not None:
+            self.assertEqual(
+                proc.returncode, expect_exit,
+                msg=f"Expected exit {expect_exit}, got {proc.returncode}\n"
+                    f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+        return proc
+
+    def test_verify_with_phase1_exits_1(self):
+        proc = self._run("--verify", "--phase", "1", "--scanner", "B3")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("--verify requires scan results", proc.stdout)
+
+    def test_phase3_without_scan_exits_1(self):
+        # Pre-populate discovery cache so we get past the discovery check
+        # and hit the "no scan results" guard.
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "discovery.json").write_text(json.dumps({"B3": [".py"]}))
+        proc = self._run("--phase", "3", "--scanner", "B3")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("No scan results", proc.stdout)
+
+    def test_dry_run_does_not_create_verify_cache(self):
+        self._run("--scanner", "B3", "--verify", "--dry-run")
+        verify_dir = self.state / "injection" / "verifications"
+        # dry-run: scan doesn't run, so no scan results, so no verify calls
+        self.assertFalse(verify_dir.exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

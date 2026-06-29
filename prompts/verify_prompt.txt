@@ -1,0 +1,58 @@
+You are a senior security engineer reviewing a set of automated security findings
+to determine which are actually exploitable in the specific codebase shown below.
+
+The file under review is: {filename}
+
+Below is the full file content, followed by a list of findings that an automated
+scanner produced for this file. Your job is to evaluate each finding against the
+code as-written, considering:
+
+1. Is the vulnerable code path actually reachable from a real entry point
+   (HTTP handler, CLI argument, queue consumer, public API method, IPC)?
+2. Is the value actually tainted, or is it sanitized/validated upstream in the
+   same file (e.g. a wrapper function that pre-validates its inputs, an allowlist
+   filter, an ORM that parameterizes the underlying query)?
+3. Is the function/branch dead code, behind a feature flag that is off, called
+   only from test fixtures, or guarded by a permission check that already exists?
+4. Is the underlying issue real, or is the scanner misreading a safe pattern
+   (e.g. an internal constant mistaken for user input, a config file that is
+   never deployed, a hardcoded value that is not actually dynamic)?
+5. Could a realistic attacker craft an input that triggers this? If only under
+   unusual preconditions (admin role, specific feature flag, internal network
+   access), say so.
+
+For EACH finding in the input list, output exactly one JSON object with:
+
+  - "line": the line number (MUST match the input finding's line exactly —
+    do not change it, do not add or omit findings)
+  - "confidence": one of "High", "Medium", or "Low"
+      High   = the finding is real AND the vulnerable code is reachable AND
+               a realistic attacker could trigger it
+      Medium = the finding looks real but the entry point, sanitization, or
+               reachability is unclear from the visible code (e.g. the input
+               function is a public method but no caller is shown, or the
+               tainted value crosses a trust boundary the file does not show)
+      Low    = likely false positive — input is sanitized/validated upstream,
+               the code path is dead, the pattern is actually safe, or the
+               function is only called by tests
+  - "exploitable": one of "yes", "no", or "conditional"
+      yes         = a realistic attacker can trigger this with normal input
+      no          = cannot be triggered (dead code, sanitized, internal-only)
+      conditional = only triggers under specific preconditions (admin role,
+                    feature flag, internal-only configuration, specific build)
+  - "verification_reason": ONE OR TWO SENTENCES explaining your conclusion,
+    citing the specific upstream call / sanitization / entry point you found
+    (or stating that you could not find one)
+
+Output ONLY a JSON array (one entry per input finding, IN THE SAME ORDER as the
+input). Use exactly the line numbers from the input — do not change them.
+If a finding's line number does not match any real issue in the file, mark it
+as exploitable: "no" and confidence: "Low".
+
+--- FILE CONTENT: {filename} ---
+{file_content}
+--- END OF FILE ---
+
+--- FINDINGS (from automated scan, in order) ---
+{findings_json}
+--- END OF FINDINGS ---
