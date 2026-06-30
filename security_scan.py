@@ -766,6 +766,24 @@ def load_verify_prompt() -> str:
     return DEFAULT_VERIFY_PROMPT
 
 
+def _verify_cache_usable(cache_file: Path) -> bool:
+    """True if the cache file exists and holds a successful verification.
+
+    Cache entries with status error/timeout are treated as misses so the
+    next run retries the verification rather than reusing a cached failure.
+    A corrupt or unreadable cache file also returns False (treated as miss)
+    so a transient disk error doesn't permanently block the file.
+    """
+    if not cache_file.exists():
+        return False
+    try:
+        with open(cache_file) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return data.get("status") == "ok"
+
+
 def verify_finding(
     filepath: Path,
     scanner_cfg: dict,
@@ -786,6 +804,10 @@ def verify_finding(
     Caches the per-(scanner, file) verification result; cache key invalidates
     when file content, findings list, or verify prompt changes.
 
+    Failed verifications (pi error or timeout) are NOT cached. Any
+    pre-existing failed cache entry for this key is removed before the
+    call so a transient failure on one run is retried on the next.
+
     `tools` is forwarded to `call_pi`. When set, the model can read related
     files (callers, sanitizers, auth middleware) before judging each
     finding — the cross-file judgment that makes the verify phase
@@ -805,7 +827,7 @@ def verify_finding(
     key = verify_file_key(rel, scanner_cfg["name"], c_hash, f_sig, verify_prompt_hash_value)
     cache_file = verify_dir / f"{key}.json"
 
-    if not force and cache_file.exists():
+    if not force and _verify_cache_usable(cache_file):
         print(f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
         return {"file": rel, "scanner": scanner_cfg["name"], "status": "cached"}
 
@@ -868,11 +890,19 @@ def verify_finding(
     if status != "ok":
         data["error"] = raw[:2000]
 
-    tmp_path = cache_file.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(data))
-    shutil.move(str(tmp_path), str(cache_file))
-
-    if status != "ok":
+    if status == "ok":
+        tmp_path = cache_file.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data))
+        shutil.move(str(tmp_path), str(cache_file))
+    else:
+        # Don't cache failures. Remove any prior cache entry (including a
+        # stale failed one left by an older run) so the next run treats
+        # this file as a miss and retries the verification.
+        if cache_file.exists():
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
         print(f"[{status.upper()}] [VERIFY] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
 
     return data
@@ -969,7 +999,10 @@ def run_verification(
                 v_key = verify_file_key(
                     rel, scanner_cfg["name"], c_hash, f_sig, v_prompt_hash,
                 )
-                if (verify_dir / f"{v_key}.json").exists():
+                # Treat stale failed cache entries as misses so a prior
+                # timeout/error gets retried on the next run instead of
+                # blocking the file forever.
+                if _verify_cache_usable(verify_dir / f"{v_key}.json"):
                     print(f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
                     cached_count += 1
                     continue

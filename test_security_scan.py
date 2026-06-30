@@ -775,6 +775,60 @@ class TestVerifyFindingMocked(unittest.TestCase):
         self.assertEqual(result["verifications"], {})
         self.assertIn("parse_error", result)
 
+    def test_pi_error_does_not_write_cache(self):
+        # A failed pi call (non-ok status) must not leave a cache entry
+        # behind, otherwise the next run would skip the retry.
+        with patch.object(ss, "call_pi", return_value=("error", "pi broke")):
+            result = ss.verify_finding(
+                self.f, self.cfg, "code.py", self.findings,
+                self.root, self.verify_dir, self.sessions,
+                "prompt template", ss.prompt_hash("prompt template"), timeout=60,
+            )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("pi broke", result["error"])
+        self.assertEqual(list(self.verify_dir.glob("*.json")), [])
+
+    def test_pi_timeout_does_not_write_cache(self):
+        with patch.object(ss, "call_pi", return_value=("timeout", "timed out")):
+            result = ss.verify_finding(
+                self.f, self.cfg, "code.py", self.findings,
+                self.root, self.verify_dir, self.sessions,
+                "prompt template", ss.prompt_hash("prompt template"), timeout=60,
+            )
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(list(self.verify_dir.glob("*.json")), [])
+
+    def test_pi_error_removes_stale_failed_cache(self):
+        # A previous run left a failed cache entry. The next run must
+        # detect it as a miss, re-run the verification, and (on success)
+        # replace it — never reuse the cached failure.
+        c_hash = ss.content_hash(self.f.read_bytes())
+        f_sig = ss.findings_signature(self.findings)
+        vph = ss.prompt_hash("prompt template")
+        key = ss.verify_file_key("code.py", "test", c_hash, f_sig, vph)
+        (self.verify_dir / f"{key}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "test", "status": "error",
+            "error": "prior failure",
+            "verifications": {}, "findings_signature": f_sig,
+            "verify_prompt_hash": vph, "content_hash": c_hash,
+        }))
+        pi_response = json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "reachable"},
+        ])
+        with patch.object(ss, "call_pi", return_value=("ok", pi_response)) as mock_pi:
+            result = ss.verify_finding(
+                self.f, self.cfg, "code.py", self.findings,
+                self.root, self.verify_dir, self.sessions,
+                "prompt template", vph, timeout=60,
+            )
+        self.assertEqual(result["status"], "ok")
+        mock_pi.assert_called_once()
+        cache_files = list(self.verify_dir.glob("*.json"))
+        self.assertEqual(len(cache_files), 1)
+        cached = json.loads(cache_files[0].read_text())
+        self.assertEqual(cached["status"], "ok")
+
 
 class TestLoadVerificationForFile(unittest.TestCase):
     def setUp(self):
