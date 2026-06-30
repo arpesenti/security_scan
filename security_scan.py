@@ -794,7 +794,7 @@ def verify_finding(
     session_dir: Path,
     verify_template: str,
     verify_prompt_hash_value: str,
-    timeout: int = 180,
+    timeout: int = 300,
     force: bool = False,
     tools: list[str] | None = None,
 ) -> dict:
@@ -917,7 +917,7 @@ def run_verification(
     concurrency: int,
     reverify: bool,
     dry_run: bool,
-    verify_timeout: int = 180,
+    verify_timeout: int = 300,
     tools: list[str] | None = None,
     scan_uses_tools: bool = False,
     progress: "ProgressTracker | None" = None,
@@ -2320,8 +2320,10 @@ OWASP 2025 Categories:
     parser.add_argument(
         "--verify-timeout",
         type=int,
-        default=180,
-        help="Per-file verification pi call timeout in seconds (default: 180)",
+        default=300,
+        help="Per-file verification pi call timeout in seconds (default: 300). "
+             "Longer than --scan-timeout because the verifier uses read-only "
+             "tools by default and may chase callers/sanitizers across files.",
     )
     parser.add_argument(
         "--discovery-tools",
