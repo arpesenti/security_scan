@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -351,6 +352,147 @@ def call_pi(
         return "error", f"exit_code_{proc.returncode}: {proc.stderr.strip()[:500]}"
 
     return "ok", raw
+
+
+# ── Progress tracker ────────────────────────────────────────────────────────
+
+
+class ProgressTracker:
+    """Thread-safe progress reporter that renders a single in-place line on
+    stderr, showing per-phase counters and ETA.
+
+    Usage:
+
+        progress = ProgressTracker()                 # enabled, TTY-detected
+        progress = ProgressTracker(enabled=False)   # silent, all methods no-op
+        progress.start_phase("scan", total=1000)
+        ...                                          # do work, call tick() on completion
+        progress.tick("scan")
+        progress.stop()                             # prints final line
+
+    Rendering strategy:
+      - On a TTY, refreshes every `refresh_interval` seconds using `\\r` so
+        the line overwrites itself in place. Padded with spaces to clear
+        residual characters from longer previous lines.
+      - Off-TTY (CI logs, redirected stderr), refreshes on the same
+        interval but writes a new line each time. One line per update,
+        no escape sequences, easy to grep.
+
+    The renderer runs on a daemon thread; `stop()` joins it and emits the
+    final newline-terminated line so the value survives in the terminal.
+    """
+
+    def __init__(self, enabled: bool = True, refresh_interval: float = 0.5):
+        self.enabled = enabled
+        self.refresh_interval = refresh_interval
+        # phase name -> {total, completed, started_at}
+        self._phases: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._render_thread: threading.Thread | None = None
+        # TTY detection: only use \r when stderr is a real terminal AND the
+        # user didn't redirect it. CI logs and `2>file.log` get newline
+        # updates so each tick is its own grep-able line.
+        self._use_cr = enabled and sys.stderr.isatty()
+
+    def start_phase(self, phase: str, total: int) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._phases[phase] = {
+                "total": max(int(total), 0),
+                "completed": 0,
+                "started_at": time.time(),
+            }
+        self._ensure_render_thread()
+
+    def tick(self, phase: str, amount: int = 1) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            entry = self._phases.get(phase)
+            if entry is not None:
+                entry["completed"] = min(
+                    entry["completed"] + amount,
+                    entry["total"],
+                )
+
+    def stop(self) -> None:
+        if not self.enabled:
+            return
+        self._stop_event.set()
+        if self._render_thread is not None:
+            self._render_thread.join(timeout=2.0)
+        # Final render with a real newline so the line survives.
+        self._render(force_newline=True)
+
+    def _ensure_render_thread(self) -> None:
+        if self._render_thread is not None:
+            return
+        self._render_thread = threading.Thread(
+            target=self._render_loop,
+            name="progress-tracker",
+            daemon=True,
+        )
+        self._render_thread.start()
+
+    def _render_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._render()
+            # sleep in small slices so stop() returns promptly
+            self._stop_event.wait(self.refresh_interval)
+
+    def _render(self, force_newline: bool = False) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if not self._phases:
+                return
+            parts: list[str] = []
+            now = time.time()
+            for phase, data in self._phases.items():
+                total = data["total"]
+                if total <= 0:
+                    continue
+                completed = data["completed"]
+                if completed >= total:
+                    parts.append(f"[{phase}] {completed}/{total} (done)")
+                    continue
+                elapsed = max(now - data["started_at"], 1e-6)
+                rate = completed / elapsed
+                remaining = total - completed
+                eta = remaining / rate if rate > 0 else float("inf")
+                parts.append(
+                    f"[{phase}] {completed}/{total} "
+                    f"({rate:.1f}/s, ETA {_format_eta(eta)})"
+                )
+        if not parts:
+            return
+        line = " · ".join(parts)
+        # Pad to 80 chars so a shorter line overwrites any residue from
+        # a longer previous one when we're using \r. Off-TTY we don't pad
+        # because the trailing spaces would just be noise in logs.
+        if self._use_cr and not force_newline:
+            padded = line.ljust(80)
+            sys.stderr.write("\r" + padded)
+            sys.stderr.flush()
+        else:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+
+
+def _format_eta(seconds: float) -> str:
+    if seconds == float("inf") or seconds < 0:
+        return "?"
+    if seconds < 1:
+        return "<1s"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h{mins:02d}m"
 
 
 # ── Phase 1: Discovery ──────────────────────────────────────────────────────
@@ -748,6 +890,7 @@ def run_verification(
     verify_timeout: int = 180,
     tools: list[str] | None = None,
     scan_uses_tools: bool = False,
+    progress: "ProgressTracker | None" = None,
 ) -> tuple[dict, list[dict]]:
     """Phase 3: Verify findings for every file that has at least one finding
     in this scanner's results dir. Files with no findings, suppressed
@@ -822,6 +965,8 @@ def run_verification(
         return scanner_cfg, []
 
     verified: list[dict] = []
+    if progress is not None and files_to_verify:
+        progress.start_phase("verify", total=len(files_to_verify))
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(
@@ -838,6 +983,9 @@ def run_verification(
             except Exception as e:
                 fp, rel = futures[future]
                 print(f"[ERROR] [VERIFY] [{scanner_cfg['name']}] {rel}: {e}", file=sys.stderr)
+            finally:
+                if progress is not None:
+                    progress.tick("verify")
 
     return scanner_cfg, verified
 
@@ -982,6 +1130,7 @@ def run_scanner(
     format_override: list[str] | None = None,
     scan_timeout: int = 180,
     tools: list[str] | None = None,
+    progress: "ProgressTracker | None" = None,
 ) -> tuple[dict, list[dict]]:
     """Run a single OWASP scanner across relevant files.
 
@@ -1054,6 +1203,8 @@ def run_scanner(
         return scanner_cfg, []
 
     scanned = []
+    if progress is not None and pending:
+        progress.start_phase("scan", total=len(pending))
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(
@@ -1069,6 +1220,9 @@ def run_scanner(
             except Exception as e:
                 f = futures[future]
                 print(f"[ERROR] [{scanner_cfg['name']}] {f.relative_to(repo_root)}: {e}", file=sys.stderr)
+            finally:
+                if progress is not None:
+                    progress.tick("scan")
 
     return scanner_cfg, scanned
 
@@ -2124,6 +2278,14 @@ OWASP 2025 Categories:
              "file-as-written verifier.",
     )
     parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show an in-place stderr progress line with per-phase counters "
+             "and ETA. Default: on. Disable with --no-progress for quiet CI "
+             "logs or batch runs.",
+    )
+    parser.add_argument(
         "--fail-on-confidence",
         choices=["never", "low", "medium", "high"],
         default="never",
@@ -2228,154 +2390,164 @@ OWASP 2025 Categories:
         print(f"  ... and {len(ext_map) - 15} more")
     print()
 
-    # ── Phase 1: Discovery ──
-    discovery_map = {}
-    if args.phase == 0 or args.phase == 1:
-        discovery_map = run_discovery(
-            repo_root, ext_map, name_map,
-            discovery_cache, session_dir,
-            redetect=args.redetect,
-            timeout=args.discovery_timeout,
-            tools=phase_tool_lists["discovery"],
-        )
-
-    if args.phase == 1:
-        print("\nDiscovery complete. Run with --phase 2 or no --phase flag to scan.")
-        return
-
-    # ── If phase 2 or 3, load discovery from cache ──
-    if args.phase in (2, 3) and not discovery_map:
-        if discovery_cache.exists():
-            try:
-                with open(discovery_cache) as f:
-                    discovery_map = json.load(f)
-            except (OSError, json.JSONDecodeError) as e:
-                print(f"Discovery cache unreadable ({e}). Run with --phase 1 or --redetect first.")
-                sys.exit(1)
-        else:
-            print("No discovery cache found. Run with --phase 1 or no --phase flag first.")
-            sys.exit(1)
-
-    # ── Phase 2: Scan (skipped when --phase 3: run verification only) ──
-    all_results = []
-    if args.phase != 3:
-        print()
-        if args.phase == 2:
-            print("Phase 2: Scanning (using cached discovery)...")
-        else:
-            print("Phase 2: Scanning...")
-
-        format_override = None
-        if args.formats:
-            format_override = [e if e.startswith(".") else f".{e}" for e in args.formats.split(",")]
-
-        for scanner_id in scanner_ids:
-            cfg = OWASP_SCANNERS[scanner_id]
-            _, results = run_scanner(
-                scanner_id, cfg, ext_map, name_map, discovery_map,
-                repo_root, state_dir, session_dir,
-                args.concurrency, args.max_files, args.rescan, args.dry_run,
-                format_override=format_override,
-                scan_timeout=args.scan_timeout,
-                tools=phase_tool_lists["scan"],
+    # Progress tracker. On a TTY it refreshes a single line in place with
+    # \r; off-TTY it writes one line per update so CI logs are grep-able.
+    # Wrapped in try/finally so the renderer is always stopped and the
+    # final line is emitted — even on sys.exit() from the report gates.
+    progress = ProgressTracker(enabled=bool(args.progress))
+    try:
+        # ── Phase 1: Discovery ──
+        discovery_map = {}
+        if args.phase == 0 or args.phase == 1:
+            discovery_map = run_discovery(
+                repo_root, ext_map, name_map,
+                discovery_cache, session_dir,
+                redetect=args.redetect,
+                timeout=args.discovery_timeout,
+                tools=phase_tool_lists["discovery"],
             )
-            all_results.extend(results)
-
-    # ── Phase 3: Verification (only when --verify or --phase 3) ──
-    if run_verify and not args.dry_run:
-        # For phase 3, verify even with --dry-run is a no-op (we'd be listing
-        # files that may or may not have scan results yet).
-        # Look in the results dir that matches the current scan tools config,
-        # so the verifier and the scanner it judges are in lockstep.
-        results_dir_for_verify = (
-            "results-tools" if phase_tools["scan"] else "results"
-        )
-        any_results = False
-        for sid in scanner_ids:
-            cfg = OWASP_SCANNERS[sid]
-            if (state_dir / cfg["name"] / results_dir_for_verify).exists():
-                any_results = True
-                break
-        if not any_results:
-            if args.phase == 3:
-                print("No scan results found. Run with --phase 2 (or no --phase flag) first.")
-                sys.exit(1)
+    
+        if args.phase == 1:
+            print("\nDiscovery complete. Run with --phase 2 or no --phase flag to scan.")
+            return
+    
+        # ── If phase 2 or 3, load discovery from cache ──
+        if args.phase in (2, 3) and not discovery_map:
+            if discovery_cache.exists():
+                try:
+                    with open(discovery_cache) as f:
+                        discovery_map = json.load(f)
+                except (OSError, json.JSONDecodeError) as e:
+                    print(f"Discovery cache unreadable ({e}). Run with --phase 1 or --redetect first.")
+                    sys.exit(1)
             else:
-                print("[VERIFY] No scan results yet; skipping verification pass.")
-        else:
+                print("No discovery cache found. Run with --phase 1 or no --phase flag first.")
+                sys.exit(1)
+    
+        # ── Phase 2: Scan (skipped when --phase 3: run verification only) ──
+        all_results = []
+        if args.phase != 3:
             print()
-            print("=" * 60)
-            print(" Phase 3: Verifying findings...")
-            print("=" * 60)
+            if args.phase == 2:
+                print("Phase 2: Scanning (using cached discovery)...")
+            else:
+                print("Phase 2: Scanning...")
+    
+            format_override = None
+            if args.formats:
+                format_override = [e if e.startswith(".") else f".{e}" for e in args.formats.split(",")]
+    
             for scanner_id in scanner_ids:
                 cfg = OWASP_SCANNERS[scanner_id]
-                _, vresults = run_verification(
-                    scanner_id, cfg, repo_root, state_dir, session_dir,
-                    args.concurrency, args.reverify, args.dry_run,
-                    verify_timeout=args.verify_timeout,
-                    tools=phase_tool_lists["verify"],
-                    scan_uses_tools=phase_tools["scan"],
+                _, results = run_scanner(
+                    scanner_id, cfg, ext_map, name_map, discovery_map,
+                    repo_root, state_dir, session_dir,
+                    args.concurrency, args.max_files, args.rescan, args.dry_run,
+                    format_override=format_override,
+                    scan_timeout=args.scan_timeout,
+                    tools=phase_tool_lists["scan"],
+                    progress=progress,
+            )
+            all_results.extend(results)
+    
+        # ── Phase 3: Verification (only when --verify or --phase 3) ──
+        if run_verify and not args.dry_run:
+            # For phase 3, verify even with --dry-run is a no-op (we'd be listing
+            # files that may or may not have scan results yet).
+            # Look in the results dir that matches the current scan tools config,
+            # so the verifier and the scanner it judges are in lockstep.
+            results_dir_for_verify = (
+                "results-tools" if phase_tools["scan"] else "results"
+            )
+            any_results = False
+            for sid in scanner_ids:
+                cfg = OWASP_SCANNERS[sid]
+                if (state_dir / cfg["name"] / results_dir_for_verify).exists():
+                    any_results = True
+                    break
+            if not any_results:
+                if args.phase == 3:
+                    print("No scan results found. Run with --phase 2 (or no --phase flag) first.")
+                    sys.exit(1)
+                else:
+                    print("[VERIFY] No scan results yet; skipping verification pass.")
+            else:
+                print()
+                print("=" * 60)
+                print(" Phase 3: Verifying findings...")
+                print("=" * 60)
+                for scanner_id in scanner_ids:
+                    cfg = OWASP_SCANNERS[scanner_id]
+                    _, vresults = run_verification(
+                        scanner_id, cfg, repo_root, state_dir, session_dir,
+                        args.concurrency, args.reverify, args.dry_run,
+                        verify_timeout=args.verify_timeout,
+                        tools=phase_tool_lists["verify"],
+                        scan_uses_tools=phase_tools["scan"],
+                        progress=progress,
+                    )
+                    # Verification results are read back from disk in build_report
+                    # via load_verification_for_file, so we don't need to forward
+                    # them here. The list is kept for parity with the scan loop.
+                    all_results.extend(vresults)
+    
+        # ── Report ──
+        if not args.dry_run:
+            print()
+            print("=" * 60)
+            print(f" Building report ({args.report_format.upper()})...")
+            print("=" * 60)
+            allowlist = load_allowlist(state_dir)
+            if allowlist:
+                print(f"  Allowlist: {len(allowlist)} suppression(s) loaded")
+            confidence_threshold = (
+                None if args.fail_on_confidence == "never" else args.fail_on_confidence
+            )
+            if args.report_format == "md":
+                stats = build_report(
+                    state_dir, output_path, repo_root, scanner_ids, discovery_map,
+                    allowlist, confidence_threshold=confidence_threshold,
+                    phase_tools=phase_tools,
                 )
-                # Verification results are read back from disk in build_report
-                # via load_verification_for_file, so we don't need to forward
-                # them here. The list is kept for parity with the scan loop.
-                all_results.extend(vresults)
-
-    # ── Report ──
-    if not args.dry_run:
-        print()
-        print("=" * 60)
-        print(f" Building report ({args.report_format.upper()})...")
-        print("=" * 60)
-        allowlist = load_allowlist(state_dir)
-        if allowlist:
-            print(f"  Allowlist: {len(allowlist)} suppression(s) loaded")
-        confidence_threshold = (
-            None if args.fail_on_confidence == "never" else args.fail_on_confidence
-        )
-        if args.report_format == "md":
-            stats = build_report(
-                state_dir, output_path, repo_root, scanner_ids, discovery_map,
-                allowlist, confidence_threshold=confidence_threshold,
-                phase_tools=phase_tools,
-            )
-        else:
-            delimiter = "\t" if args.report_format == "tsv" else ","
-            stats = build_csv_report(
-                state_dir, output_path, repo_root, scanner_ids, discovery_map,
-                allowlist, confidence_threshold=confidence_threshold,
-                delimiter=delimiter,
-                phase_tools=phase_tools,
-            )
-
-        # Exit-code logic for CI integration.
-        #
-        # Two independent gates can be in play:
-        #   --fail-on <sev>           -> raw severity counts
-        #   --fail-on-confidence <lvl> -> gated counts (only findings whose
-        #                                 verifier confidence is at or above
-        #                                 the level)
-        # Either gate that trips exits 1. The raw --fail-on is intentionally
-        # unchanged from the original behavior; --fail-on-confidence is the
-        # new knob for confidence-based gating.
-        if args.fail_on != "never":
-            triggered = max_severity_at_or_above(stats["severity_counts"], args.fail_on)
-            if triggered > 0:
-                print(f"\n[FAIL] Findings at or above '{args.fail_on}' threshold "
-                      f"({triggered}). Exiting 1.")
-                sys.exit(1)
-        if args.fail_on_confidence != "never":
-            gated = stats.get("severity_counts_gated") or stats["severity_counts"]
-            triggered = sum(gated.values())
-            if triggered > 0:
-                print(f"\n[FAIL] {triggered} finding(s) at or above "
-                      f"'{args.fail_on_confidence}' confidence threshold. Exiting 1.")
-                sys.exit(1)
-        if stats["error_count"] > 0:
-            print(f"\n[WARN] {stats['error_count']} file(s) errored during scan. "
-                  f"Exiting 2.")
-            sys.exit(2)
-        sys.exit(0)
+            else:
+                delimiter = "\t" if args.report_format == "tsv" else ","
+                stats = build_csv_report(
+                    state_dir, output_path, repo_root, scanner_ids, discovery_map,
+                    allowlist, confidence_threshold=confidence_threshold,
+                    delimiter=delimiter,
+                    phase_tools=phase_tools,
+                )
+    
+            # Exit-code logic for CI integration.
+            #
+            # Two independent gates can be in play:
+            #   --fail-on <sev>           -> raw severity counts
+            #   --fail-on-confidence <lvl> -> gated counts (only findings whose
+            #                                 verifier confidence is at or above
+            #                                 the level)
+            # Either gate that trips exits 1. The raw --fail-on is intentionally
+            # unchanged from the original behavior; --fail-on-confidence is the
+            # new knob for confidence-based gating.
+            if args.fail_on != "never":
+                triggered = max_severity_at_or_above(stats["severity_counts"], args.fail_on)
+                if triggered > 0:
+                    print(f"\n[FAIL] Findings at or above '{args.fail_on}' threshold "
+                          f"({triggered}). Exiting 1.")
+                    sys.exit(1)
+            if args.fail_on_confidence != "never":
+                gated = stats.get("severity_counts_gated") or stats["severity_counts"]
+                triggered = sum(gated.values())
+                if triggered > 0:
+                    print(f"\n[FAIL] {triggered} finding(s) at or above "
+                          f"'{args.fail_on_confidence}' confidence threshold. Exiting 1.")
+                    sys.exit(1)
+            if stats["error_count"] > 0:
+                print(f"\n[WARN] {stats['error_count']} file(s) errored during scan. "
+                      f"Exiting 2.")
+                sys.exit(2)
+            sys.exit(0)
+    finally:
+        progress.stop()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ to rate each finding's confidence and exploitability in the context of the file 
 - Per-phase **read-only tool support** (`--discovery-tools` / `--scan-tools` / `--verify-tools`)
   so the model can inspect related files (callers, sanitizers, auth middleware) when
   making judgments
+- **In-place progress line** with per-phase count + rate + ETA, on stderr, TTY-aware
+  (`--no-progress` to silence)
 - Concurrent scans (`--concurrency`)
 - Dry-run mode (`--dry-run`) for previewing which files would be scanned
 - Override the per-scanner extension list (`--formats`)
@@ -210,6 +212,39 @@ verdict. CI that gates on `--fail-on-confidence high` should keep the
 default (verify tools on) but accept that the verdict is a probabilistic
 signal, not a proof. For pure determinism, pass `--no-verify-tools`.
 
+## Progress indicator
+
+Long runs (10k+ files, 100k+ findings to verify) can take hours, so the
+scanner writes a single in-place progress line to **stderr** while the
+work is in flight. It looks like:
+
+```
+[scan] 123/9005 (12.3/s, ETA 12m)    [verify] 50/200 (5.0/s, ETA 30s)
+```
+
+The line is updated every 0.5s by a daemon thread and shows the current
+phase, completed/total count, throughput in items/sec, and an ETA.
+
+**TTY-aware**:
+- On an interactive terminal, it uses `\r` so the line overwrites itself
+  in place (padded with spaces to clear residue from longer previous
+  lines).
+- When stderr is not a TTY (CI logs, `2>file.log`), it writes a new line
+  per update. One line per tick, no escape sequences, easy to grep.
+
+**Behavior**:
+- Disabled with `--no-progress` (no daemon thread, no overhead).
+- Wrapped in a `try/finally` so the renderer is always stopped and the
+  final line is emitted — even on `sys.exit()` from the report gates.
+- `discovery` is a single call, so it doesn't get a progress line (it
+  would only ever show 0/1 or 1/1). The first progress line appears
+  when phase 2 starts.
+
+The per-file `[SCAN] [B3] filename.py` lines continue to print so you
+can see what's currently being processed; the progress line is the
+summary. With `concurrency > 1` the two can interleave on stderr but
+each is independently grep-able.
+
 ## CLI reference
 
 | Flag | Default | Description |
@@ -236,6 +271,7 @@ signal, not a proof. For pure determinism, pass `--no-verify-tools`.
 | `--discovery-tools` / `--no-discovery-tools` | on | Give phase 1 (discovery) read-only tools (`read`,`grep`,`find`,`ls`). The model can browse the repo before deciding which extensions matter. |
 | `--scan-tools` / `--no-scan-tools` | off | Give phase 2 (scan) read-only tools. Off by default — scan is high-recall single-file; tools add cost and prompt-injection surface. |
 | `--verify-tools` / `--no-verify-tools` | on | Give phase 3 (verify) read-only tools. The model can read related files (callers, sanitizers, auth middleware) before rating each finding's confidence. |
+| `--progress` / `--no-progress` | on | Show an in-place stderr progress line with per-phase counts and ETA. Use `--no-progress` for quiet CI logs. |
 
 ## Cache invalidation
 

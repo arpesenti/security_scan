@@ -1822,5 +1822,234 @@ class TestToolsCLI(unittest.TestCase):
             self.assertIn(flag, proc.stdout)
 
 
+# ── Progress tracker tests ───────────────────────────────────────────────────
+
+
+import io as _io  # noqa: E402
+
+
+class TestProgressTrackerBasic(unittest.TestCase):
+    """Unit tests for the ProgressTracker class itself."""
+
+    def setUp(self):
+        # Make sure we never auto-start a real daemon thread; tests that
+        # need rendering will mock sys.stderr and patch _use_cr explicitly.
+        self._stderr_patch = patch.object(ss.sys, "stderr", new=_io.StringIO())
+        self._stderr_patch.start()
+
+    def tearDown(self):
+        self._stderr_patch.stop()
+
+    def test_disabled_tracker_methods_are_noop(self):
+        p = ss.ProgressTracker(enabled=False)
+        p.start_phase("scan", 100)
+        p.tick("scan")
+        p.tick("scan")
+        p.tick("scan", amount=5)
+        p.stop()
+        # Nothing should have been written to stderr
+        self.assertEqual(ss.sys.stderr.getvalue(), "")
+
+    def test_start_phase_creates_entry(self):
+        p = ss.ProgressTracker(enabled=True)
+        # Force _use_cr False so the render path is deterministic
+        with patch.object(p, "_use_cr", False), \
+             patch.object(p, "_ensure_render_thread"):  # don't start daemon
+            p.start_phase("scan", 100)
+            p._render()  # one render, no ticks yet
+            out = ss.sys.stderr.getvalue()
+            self.assertIn("[scan] 0/100", out)
+
+    def test_tick_increments_completed(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_use_cr", False), \
+             patch.object(p, "_ensure_render_thread"):
+            p.start_phase("scan", 5)
+            for _ in range(3):
+                p.tick("scan")
+            p._render()
+            out = ss.sys.stderr.getvalue()
+            self.assertIn("[scan] 3/5", out)
+
+    def test_tick_caps_at_total(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_use_cr", False), \
+             patch.object(p, "_ensure_render_thread"):
+            p.start_phase("scan", 3)
+            p.tick("scan", amount=10)  # way more than total
+            p._render()
+            out = ss.sys.stderr.getvalue()
+            self.assertIn("[scan] 3/3", out)
+            self.assertIn("(done)", out)
+
+    def test_tick_unknown_phase_is_noop(self):
+        p = ss.ProgressTracker(enabled=True)
+        p.tick("nonexistent")  # no crash
+
+    def test_render_uses_cr_when_use_cr_true(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_use_cr", True), \
+             patch.object(p, "_ensure_render_thread"):
+            p.start_phase("scan", 10)
+            p._render()
+            out = ss.sys.stderr.getvalue()
+            # One \r-prefixed line, padded to 80 chars
+            self.assertTrue(out.startswith("\r"), f"expected \\r prefix, got: {out!r}")
+            # Strip \r and any trailing padding, then check length
+            payload = out.lstrip("\r").rstrip()
+            # The line should be ljust(80) — but trailing space strip may have
+            # trimmed some. So check the payload is well-formed.
+            self.assertIn("[scan] 0/10", payload)
+            self.assertGreaterEqual(len(out), 81)  # \r + at least 80 chars of content
+
+    def test_render_uses_newline_when_use_cr_false(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_use_cr", False), \
+             patch.object(p, "_ensure_render_thread"):
+            p.start_phase("scan", 10)
+            p._render()
+            out = ss.sys.stderr.getvalue()
+            self.assertTrue(out.endswith("\n"), f"expected trailing \\n, got: {out!r}")
+            # No padding when not on TTY
+            self.assertLess(len(out.rstrip("\n")), 80)
+
+    def test_stop_joins_render_thread_and_emits_final_line(self):
+        p = ss.ProgressTracker(enabled=True, refresh_interval=0.05)
+        # Mock the render thread to prevent race with stop()
+        with patch.object(p, "_ensure_render_thread"):
+            p.start_phase("scan", 2)
+            p.tick("scan")
+            p.stop()
+            out = ss.sys.stderr.getvalue()
+            self.assertIn("1/2", out)
+
+
+class TestFormatEta(unittest.TestCase):
+    def test_seconds_under_minute(self):
+        self.assertEqual(ss._format_eta(-1), "?")
+        self.assertEqual(ss._format_eta(0), "<1s")
+        self.assertEqual(ss._format_eta(0.5), "<1s")
+        self.assertEqual(ss._format_eta(30), "30s")
+
+    def test_minutes(self):
+        self.assertEqual(ss._format_eta(60), "1m00s")
+        self.assertEqual(ss._format_eta(125), "2m05s")
+
+    def test_hours(self):
+        self.assertEqual(ss._format_eta(3600), "1h00m")
+        self.assertEqual(ss._format_eta(3660), "1h01m")
+        self.assertEqual(ss._format_eta(7325), "2h02m")
+
+    def test_infinity(self):
+        self.assertEqual(ss._format_eta(float("inf")), "?")
+
+
+class TestProgressIntegration(unittest.TestCase):
+    """run_scanner and run_verification should call progress.start_phase()
+    once and progress.tick() per completed file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.sessions = self.state / "sessions"
+        self.sessions.mkdir(parents=True)
+        (self.root / "code.py").write_text("x = 1\n")
+        self.cfg = ss.OWASP_SCANNERS["B3"]
+        self.p_hash = ss.prompt_hash(ss.load_prompt_template(self.cfg))
+        self.discovery = {"B3": [".py"]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _seed_scan_cache(self, subdir, vulns):
+        c_hash = ss.content_hash((self.root / "code.py").read_bytes())
+        key = ss.file_key("code.py", "injection", c_hash, self.p_hash)
+        d = self.state / "injection" / subdir
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{key}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "injection", "status": "ok",
+            "result": vulns, "content_hash": c_hash,
+            "prompt_hash": self.p_hash,
+        }))
+
+    def test_run_scanner_calls_start_phase_and_tick(self):
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        # Use enabled=True but suppress the render thread; we only need
+        # the bookkeeping (start_phase + tick) to be exercised.
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")), \
+             patch.object(tracker, "_ensure_render_thread"):
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                progress=tracker,
+            )
+        # After the run, the phase should be 1/1 (done)
+        with tracker._lock:
+            entry = tracker._phases.get("scan")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry["total"], 1)
+            self.assertEqual(entry["completed"], 1)
+
+    def test_run_verification_calls_start_phase_and_tick(self):
+        self._seed_scan_cache("results", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))), \
+             patch.object(tracker, "_ensure_render_thread"):
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                progress=tracker,
+            )
+        with tracker._lock:
+            entry = tracker._phases.get("verify")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry["total"], 1)
+            self.assertEqual(entry["completed"], 1)
+
+    def test_run_scanner_skips_progress_when_none(self):
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        # progress=None should not crash even though the call is made
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")):
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                progress=None,
+            )
+
+    def test_progress_disabled_via_no_progress_flag(self):
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             "--scanner", "B3", "--phase", "1", "--dry-run",
+             "--redetect", "--no-progress"],
+            cwd=str(self.root),
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0)
+        # No progress line should appear in stderr
+        self.assertNotIn("[scan]", proc.stderr)
+        self.assertNotIn("[verify]", proc.stderr)
+
+    def test_help_lists_progress_flag(self):
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertIn("--progress", proc.stdout)
+        self.assertIn("--no-progress", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
