@@ -2094,7 +2094,10 @@ class TestVerifyCachePreCheck(unittest.TestCase):
         c_hash = ss.content_hash((self.root / rel).read_bytes())
         f_sig = ss.findings_signature(vulns)
         vph = ss.prompt_hash(ss.load_verify_prompt())
-        key = ss.verify_file_key("injection", rel, c_hash, f_sig, vph)
+        # verify_file_key signature is (rel, scanner_name, content_hash,
+        # findings_sig, verify_prompt_hash) — must match what
+        # run_verification's pre-check uses.
+        key = ss.verify_file_key(rel, "injection", c_hash, f_sig, vph)
         vd = self.state / "injection" / "verifications"
         vd.mkdir(parents=True, exist_ok=True)
         (vd / f"{key}.json").write_text(json.dumps({

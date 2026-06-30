@@ -962,8 +962,12 @@ def run_verification(
                 raw_bytes = filepath.read_bytes()
                 c_hash = content_hash(raw_bytes)
                 f_sig = findings_signature(vulns)
+                # verify_file_key signature is (rel, scanner_name, content_hash,
+                # findings_sig, verify_prompt_hash) — must match what
+                # verify_finding uses, or the pre-check silently misses
+                # every cache hit.
                 v_key = verify_file_key(
-                    scanner_cfg["name"], rel, c_hash, f_sig, v_prompt_hash,
+                    rel, scanner_cfg["name"], c_hash, f_sig, v_prompt_hash,
                 )
                 if (verify_dir / f"{v_key}.json").exists():
                     print(f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
