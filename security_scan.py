@@ -918,7 +918,16 @@ def run_verification(
     if not results_dir.exists():
         return scanner_cfg, []
 
+    # Compute the verify prompt hash once so we can pre-check the cache for
+    # each file. Files whose verdict is already cached are skipped from
+    # `files_to_verify` so the progress total reflects actual work — a
+    # 99%-cached run would otherwise show 99% done in the first second and
+    # then stall on the remaining 1%, giving a wildly wrong ETA.
+    verify_template = load_verify_prompt()
+    v_prompt_hash = prompt_hash(verify_template)
+
     files_to_verify: list[tuple[Path, str, list[dict]]] = []
+    cached_count = 0
     for rf in sorted(results_dir.glob("*.json")):
         try:
             with open(rf) as f:
@@ -944,17 +953,40 @@ def run_verification(
             print(f"[WARN] Skipping verify of {rel}: file no longer exists", file=sys.stderr)
             continue
 
-        files_to_verify.append((filepath, rel, vulns))
+        # Pre-check the verification cache. Reading the file here is
+        # duplicated work for uncached files (verify_finding reads it
+        # again) but the cost is one filesystem hit per file — negligible
+        # compared to the pi call it would otherwise do unnecessarily.
+        if not reverify:
+            try:
+                raw_bytes = filepath.read_bytes()
+                c_hash = content_hash(raw_bytes)
+                f_sig = findings_signature(vulns)
+                v_key = verify_file_key(
+                    scanner_cfg["name"], rel, c_hash, f_sig, v_prompt_hash,
+                )
+                if (verify_dir / f"{v_key}.json").exists():
+                    print(f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
+                    cached_count += 1
+                    continue
+            except Exception:
+                # I/O or permission error reading the file: fall through and
+                # let verify_finding handle it (it will emit the error there).
+                pass
 
-    verify_template = load_verify_prompt()
-    v_prompt_hash = prompt_hash(verify_template)
+        files_to_verify.append((filepath, rel, vulns))
 
     print(f"\n{'=' * 60}")
     print(f" Verification: {scanner_cfg['id']} - {scanner_cfg['label']}")
     print(f"{'=' * 60}")
     mode_label = "read-only tools" if tools else "no tools"
     print(f"  Mode: {mode_label}")
-    print(f"  Files with findings: {len(files_to_verify)}")
+    total_with_findings = len(files_to_verify) + cached_count
+    if cached_count and not reverify:
+        print(f"  Files with findings: {total_with_findings} "
+              f"({cached_count} already verified, {len(files_to_verify)} to verify)")
+    else:
+        print(f"  Files with findings: {len(files_to_verify)}")
 
     if dry_run:
         for _, rel, _ in files_to_verify:

@@ -2051,5 +2051,173 @@ class TestProgressIntegration(unittest.TestCase):
         self.assertIn("--no-progress", proc.stdout)
 
 
+# ── Cache-aware verify progress ─────────────────────────────────────────────
+
+
+class TestVerifyCachePreCheck(unittest.TestCase):
+    """run_verification should pre-check the cache and skip already-verified
+    files from both the executor submission and the progress total. Without
+    this, a mostly-cached run shows 99% complete in the first second and
+    then stalls on the remaining 1%, giving a wildly wrong ETA.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.sessions = self.state / "sessions"
+        self.sessions.mkdir(parents=True)
+        (self.root / "a.py").write_text("a = 1\n")
+        (self.root / "b.py").write_text("b = 2\n")
+        (self.root / "c.py").write_text("c = 3\n")
+        (self.root / "d.py").write_text("d = 4\n")
+        self.cfg = ss.OWASP_SCANNERS["B3"]
+        self.p_hash = ss.prompt_hash(ss.load_prompt_template(self.cfg))
+        self.discovery = {"B3": [".py"]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_scan_result(self, rel, vulns):
+        c_hash = ss.content_hash((self.root / rel).read_bytes())
+        key = ss.file_key(rel, "injection", c_hash, self.p_hash)
+        rd = self.state / "injection" / "results"
+        rd.mkdir(parents=True, exist_ok=True)
+        (rd / f"{key}.json").write_text(json.dumps({
+            "file": rel, "scanner": "injection", "status": "ok",
+            "result": vulns, "content_hash": c_hash,
+            "prompt_hash": self.p_hash,
+        }))
+        return c_hash
+
+    def _write_verification_cache(self, rel, vulns):
+        c_hash = ss.content_hash((self.root / rel).read_bytes())
+        f_sig = ss.findings_signature(vulns)
+        vph = ss.prompt_hash(ss.load_verify_prompt())
+        key = ss.verify_file_key("injection", rel, c_hash, f_sig, vph)
+        vd = self.state / "injection" / "verifications"
+        vd.mkdir(parents=True, exist_ok=True)
+        (vd / f"{key}.json").write_text(json.dumps({
+            "file": rel, "scanner": "injection", "status": "ok",
+            "verifications": {
+                str(v["line"]): {"confidence": "High"} for v in vulns
+            },
+            "content_hash": c_hash, "findings_signature": f_sig,
+            "verify_prompt_hash": vph,
+        }))
+
+    def test_cached_files_excluded_from_progress_total(self):
+        """With 3 files-with-findings and 2 already cached, the progress
+        total must be 1 (not 3) so the rate/ETA are accurate."""
+        vulns = [{"line": 1, "severity": "High", "code": "x",
+                  "explanation": "", "fix": ""}]
+        # Cache b.py and c.py, leave a.py uncached
+        for rel, cached in [("a.py", False), ("b.py", True), ("c.py", True)]:
+            self._write_scan_result(rel, vulns)
+            if cached:
+                self._write_verification_cache(rel, vulns)
+
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))) as mock_pi, \
+             patch.object(tracker, "_ensure_render_thread"), \
+             patch("builtins.print"):  # suppress the [VERIFY-SKIP] noise
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                progress=tracker,
+            )
+        # pi was called only once (for the one uncached file)
+        self.assertEqual(mock_pi.call_count, 1)
+        # Progress total reflects the actual work
+        with tracker._lock:
+            entry = tracker._phases.get("verify")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry["total"], 1)
+            self.assertEqual(entry["completed"], 1)
+
+    def test_reverify_bypasses_cache_pre_check(self):
+        """With --reverify, the cache should be ignored — all files with
+        findings are queued for verification."""
+        vulns = [{"line": 1, "severity": "High", "code": "x",
+                  "explanation": "", "fix": ""}]
+        for rel in ("a.py", "b.py", "c.py"):
+            self._write_scan_result(rel, vulns)
+            self._write_verification_cache(rel, vulns)
+
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))) as mock_pi, \
+             patch.object(tracker, "_ensure_render_thread"), \
+             patch("builtins.print"):
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=True, dry_run=False,
+                progress=tracker,
+            )
+        self.assertEqual(mock_pi.call_count, 3)
+        with tracker._lock:
+            entry = tracker._phases.get("verify")
+            self.assertEqual(entry["total"], 3)
+
+    def test_section_header_shows_cache_breakdown(self):
+        """The verify section header should show how many files are
+        already verified vs how many need verification, so the user knows
+        what the progress line is measuring."""
+        vulns = [{"line": 1, "severity": "High", "code": "x",
+                  "explanation": "", "fix": ""}]
+        for rel, cached in [("a.py", False), ("b.py", True), ("c.py", True), ("d.py", True)]:
+            self._write_scan_result(rel, vulns)
+            if cached:
+                self._write_verification_cache(rel, vulns)
+
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))), \
+             patch.object(tracker, "_ensure_render_thread"), \
+             patch("builtins.print") as mock_print:
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                progress=tracker,
+            )
+        # Find the "Files with findings" line in the captured prints
+        all_output = "\n".join(
+            str(call.args[0]) if call.args else "" for call in mock_print.call_args_list
+        )
+        self.assertIn("4 (3 already verified, 1 to verify)", all_output)
+
+    def test_all_cached_no_progress_total(self):
+        """If every file is cached, files_to_verify is empty and the
+        progress phase is never started (avoids a 0/0 line that
+        confuses the user)."""
+        vulns = [{"line": 1, "severity": "High", "code": "x",
+                  "explanation": "", "fix": ""}]
+        for rel in ("a.py", "b.py"):
+            self._write_scan_result(rel, vulns)
+            self._write_verification_cache(rel, vulns)
+
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(ss, "call_pi") as mock_pi, \
+             patch.object(tracker, "_ensure_render_thread"), \
+             patch("builtins.print"):
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                progress=tracker,
+            )
+        # No pi calls (all cached)
+        self.assertEqual(mock_pi.call_count, 0)
+        # The verify phase was never started in the tracker
+        with tracker._lock:
+            self.assertNotIn("verify", tracker._phases)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
