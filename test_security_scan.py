@@ -46,6 +46,20 @@ class TestCacheKey(unittest.TestCase):
         b = ss.file_key("src/foo.py", "crypto", "chash", "phash")
         self.assertNotEqual(a, b)
 
+    def test_file_key_changes_with_thinking(self):
+        # Flipping --scan-thinking must produce a different cache key;
+        # otherwise a cached "off" verdict would be returned for a
+        # "high" run (or vice versa) and the two would silently
+        # overwrite each other.
+        a = ss.file_key("src/foo.py", "injection", "chash", "phash", "off")
+        b = ss.file_key("src/foo.py", "injection", "chash", "phash", "high")
+        self.assertNotEqual(a, b)
+
+    def test_verify_file_key_changes_with_thinking(self):
+        a = ss.verify_file_key("a.py", "scanner", "chash", "fsig", "vphash", "off")
+        b = ss.verify_file_key("a.py", "scanner", "chash", "fsig", "vphash", "medium")
+        self.assertNotEqual(a, b)
+
     def test_content_and_prompt_hash_are_16_hex(self):
         self.assertEqual(len(ss.content_hash(b"anything")), 16)
         self.assertEqual(len(ss.prompt_hash("template")), 16)
@@ -144,6 +158,64 @@ class TestFindAllFiles(unittest.TestCase):
         self.assertNotIn("trick.txt", rels)
         self.assertIn("normal.py", rels)
 
+    def test_size_limit_zero_is_unlimited(self):
+        # Passing max_file_size=0 explicitly disables the cap. The
+        # default is now 1 MiB (see DEFAULT_MAX_FILE_SIZE) so a 5 MB
+        # file at the default would be dropped — pass 0 here to prove
+        # the opt-out path works.
+        self._touch("big.py", "x = 1\n" + "# pad\n" * (5 * 1024 * 1024 // 8))
+        all_files, _, _ = ss.find_all_files(self.root, max_file_size=0)
+        rels = [str(f.relative_to(self.root)) for f in all_files]
+        self.assertIn("big.py", rels)
+
+    def test_default_size_limit_is_1_mib(self):
+        # The default is 1 MiB (DEFAULT_MAX_FILE_SIZE). A 2 MiB file
+        # must be dropped with no explicit flag, while a 100 KB file
+        # is kept.
+        self._touch("huge.py", "x = 1\n" + "# pad\n" * (2 * 1024 * 1024 // 8))
+        self._touch("modest.py", "x = 1\n" + "# pad\n" * (100 * 1024 // 8))
+        all_files, _, _ = ss.find_all_files(self.root)
+        rels = [str(f.relative_to(self.root)) for f in all_files]
+        self.assertIn("modest.py", rels)
+        self.assertNotIn("huge.py", rels)
+
+    def test_default_max_file_size_constant(self):
+        # Keep the constant in sync with the documented value (1 MiB).
+        # If this changes, the README and the discovery summary
+        # wording also need to be revisited.
+        self.assertEqual(ss.DEFAULT_MAX_FILE_SIZE, 1 * 1024 * 1024)
+
+    def test_size_limit_excludes_oversized(self):
+        # With max_file_size=1024, a 2 KB file should be dropped while
+        # a small one is kept. Verifies the discovery chokepoint
+        # actually filters by size.
+        self._touch("big.py", "x = 1\n" + "# pad\n" * 200)  # ~1.6 KB
+        self._touch("small.py", "x = 1\n")
+        all_files, ext_map, name_map = ss.find_all_files(self.root, max_file_size=1024)
+        rels = [str(f.relative_to(self.root)) for f in all_files]
+        self.assertNotIn("big.py", rels)
+        self.assertIn("small.py", rels)
+        # The ext_map and name_map must also exclude the oversized
+        # file — downstream phases use these maps to find candidates.
+        self.assertNotIn("big.py", [f.name for f in ext_map[".py"]])
+        self.assertNotIn("big.py", [f.name for f in name_map.get("big.py", [])])
+
+    def test_size_limit_exact_boundary(self):
+        # A file exactly at the limit should be included (the check
+        # is `size > max_file_size`, not `>=`).
+        content = "x" * 100
+        self._touch("at_limit.py", content)
+        all_files, _, _ = ss.find_all_files(self.root, max_file_size=100)
+        rels = [str(f.relative_to(self.root)) for f in all_files]
+        self.assertIn("at_limit.py", rels)
+
+    def test_size_limit_one_byte_above_excludes(self):
+        content = "x" * 101
+        self._touch("over.py", content)
+        all_files, _, _ = ss.find_all_files(self.root, max_file_size=100)
+        rels = [str(f.relative_to(self.root)) for f in all_files]
+        self.assertNotIn("over.py", rels)
+
 
 class TestExtractJson(unittest.TestCase):
     def test_array_direct(self):
@@ -160,10 +232,71 @@ class TestExtractJson(unittest.TestCase):
     def test_no_vulnerabilities_marker(self):
         self.assertEqual(ss.extract_json_array("NO_VULNERABILITIES"), [])
 
+    def test_no_vulnerabilities_prose(self):
+        # The previous implementation only matched the exact "NO_VULNERABILITIES"
+        # token. Models usually write "No vulnerabilities found" instead, so
+        # the hardened parser also accepts the prose form.
+        self.assertEqual(ss.extract_json_array("No vulnerabilities found in this file."), [])
+
     def test_malformed_returns_error_dict(self):
         out = ss.extract_json_array("totally not json")
         self.assertIsInstance(out, dict)
         self.assertIn("error", out)
+
+    def test_empty_response(self):
+        out = ss.extract_json_array("")
+        self.assertIsInstance(out, dict)
+        self.assertIn("error", out)
+
+    def test_whitespace_only(self):
+        out = ss.extract_json_array("   \n\t  ")
+        self.assertIsInstance(out, dict)
+        self.assertIn("error", out)
+
+    def test_code_fence_json(self):
+        # Models frequently wrap JSON in ```json ... ``` even when not asked.
+        out = ss.extract_json_array('```json\n[{"line":1,"severity":"High"}]\n```')
+        self.assertEqual(out, [{"line": 1, "severity": "High"}])
+
+    def test_code_fence_no_language(self):
+        out = ss.extract_json_array('```\n[{"a":1}]\n```')
+        self.assertEqual(out, [{"a": 1}])
+
+    def test_code_fence_with_prose(self):
+        out = ss.extract_json_array('Sure, here you go:\n```json\n[{"x":2}]\n```\nDone.')
+        self.assertEqual(out, [{"x": 2}])
+
+    def test_trailing_prose_after_array(self):
+        out = ss.extract_json_array('[{"line":1}]\n\nLet me know if you need more detail.')
+        self.assertEqual(out, [{"line": 1}])
+
+    def test_stray_bracket_in_prose(self):
+        # The first `[` in the response is inside prose ("[foo]"), not the
+        # real JSON. The hardened parser walks every `[` position and
+        # returns the first one that successfully decodes as a list.
+        out = ss.extract_json_array('Reasoning: the value [foo] looks like X.\n[{"line":3}]')
+        self.assertEqual(out, [{"line": 3}])
+
+    def test_comma_inside_string_value(self):
+        out = ss.extract_json_array('[{"line":1,"code":"a, b, c"},{"line":2}]')
+        self.assertEqual(out, [{"line": 1, "code": "a, b, c"}, {"line": 2}])
+
+    def test_truncated_missing_closing_bracket(self):
+        # Common failure mode when the model runs out of output tokens: the
+        # array is complete but the trailing `]` is missing. The recovery
+        # path closes the array at the last `}` and parses.
+        out = ss.extract_json_array('[{"line":1,"code":"x"},{"line":2,"code":"y"}')
+        self.assertEqual(out, [{"line": 1, "code": "x"}, {"line": 2, "code": "y"}])
+
+    def test_truncated_mid_object_recovers_prefix(self):
+        # The second object never closes. The recovery returns the longest
+        # valid prefix — the first complete object.
+        out = ss.extract_json_array('[{"line":1,"code":"x"},{"line":2,"code":')
+        self.assertEqual(out, [{"line": 1, "code": "x"}])
+
+    def test_nested_array(self):
+        out = ss.extract_json_array('[[1,2],[3,4]]')
+        self.assertEqual(out, [[1, 2], [3, 4]])
 
     def test_object_direct(self):
         out = ss.extract_json_object('{"B1": [".py"]}')
@@ -177,6 +310,23 @@ class TestExtractJson(unittest.TestCase):
         out = ss.extract_json_object("garbage")
         self.assertIsInstance(out, dict)
         self.assertIn("error", out)
+
+    def test_object_empty(self):
+        out = ss.extract_json_object("")
+        self.assertIsInstance(out, dict)
+        self.assertIn("error", out)
+
+    def test_object_code_fence(self):
+        out = ss.extract_json_object('```json\n{"B1": [".py"]}\n```')
+        self.assertEqual(out, {"B1": [".py"]})
+
+    def test_object_stray_brace_in_prose(self):
+        out = ss.extract_json_object('Note: {something arbitrary}. Then: {"B1": ["x"]}')
+        self.assertEqual(out, {"B1": ["x"]})
+
+    def test_object_truncated_recovers_prefix(self):
+        out = ss.extract_json_object('{"B1": [".py"], "B2":')
+        self.assertEqual(out, {"B1": [".py"]})
 
 
 class TestAllowlist(unittest.TestCase):
@@ -278,9 +428,10 @@ class TestScanFileMocked(unittest.TestCase):
         self.assertEqual(len(cache_files), 1)
 
     def test_cache_hit_skips_pi(self):
-        # Pre-populate cache using the new key format
+        # Pre-populate cache using the new key format (key includes
+        # thinking, so we pass it explicitly to match the scan_file default).
         c_hash = ss.content_hash(self.f.read_bytes())
-        key = ss.file_key("code.py", "test", c_hash, "phash")
+        key = ss.file_key("code.py", "test", c_hash, "phash", "off")
         (self.results / f"{key}.json").write_text(json.dumps({
             "file": "code.py", "scanner": "test", "status": "ok",
             "result": [], "content_hash": c_hash, "prompt_hash": "phash",
@@ -289,14 +440,14 @@ class TestScanFileMocked(unittest.TestCase):
             result = ss.scan_file(
                 self.f, self.cfg, self.root, self.results, self.sessions,
                 "FILE: {filename}\n{file_content}",
-                prompt_hash_value="phash", timeout=60,
+                prompt_hash_value="phash", timeout=60, thinking="off",
             )
         self.assertEqual(result["status"], "cached")
         mock_pi.assert_not_called()
 
     def test_content_change_invalidates_cache(self):
         c_hash = ss.content_hash(self.f.read_bytes())
-        key = ss.file_key("code.py", "test", c_hash, "phash")
+        key = ss.file_key("code.py", "test", c_hash, "phash", "off")
         (self.results / f"{key}.json").write_text(json.dumps({
             "file": "code.py", "scanner": "test", "status": "ok", "result": [],
         }))
@@ -306,13 +457,13 @@ class TestScanFileMocked(unittest.TestCase):
             result = ss.scan_file(
                 self.f, self.cfg, self.root, self.results, self.sessions,
                 "FILE: {filename}\n{file_content}",
-                prompt_hash_value="phash", timeout=60,
+                prompt_hash_value="phash", timeout=60, thinking="off",
             )
         self.assertEqual(result["status"], "ok")
 
     def test_prompt_change_invalidates_cache(self):
         c_hash = ss.content_hash(self.f.read_bytes())
-        key = ss.file_key("code.py", "test", c_hash, "OLDPROMPT")
+        key = ss.file_key("code.py", "test", c_hash, "OLDPROMPT", "off")
         (self.results / f"{key}.json").write_text(json.dumps({
             "file": "code.py", "scanner": "test", "status": "ok", "result": [],
         }))
@@ -321,7 +472,7 @@ class TestScanFileMocked(unittest.TestCase):
             result = ss.scan_file(
                 self.f, self.cfg, self.root, self.results, self.sessions,
                 "FILE: {filename}\n{file_content}",
-                prompt_hash_value="NEWPROMPT", timeout=60,
+                prompt_hash_value="NEWPROMPT", timeout=60, thinking="off",
             )
         self.assertEqual(result["status"], "ok")
 
@@ -365,7 +516,7 @@ class TestScanFileMocked(unittest.TestCase):
         # detect it as a miss, re-scan, and (on success) replace it —
         # never reuse the cached failure.
         c_hash = ss.content_hash(self.f.read_bytes())
-        key = ss.file_key("code.py", "test", c_hash, "phash")
+        key = ss.file_key("code.py", "test", c_hash, "phash", "off")
         (self.results / f"{key}.json").write_text(json.dumps({
             "file": "code.py", "scanner": "test", "status": "error",
             "result": {"error": "prior failure"},
@@ -375,7 +526,7 @@ class TestScanFileMocked(unittest.TestCase):
             result = ss.scan_file(
                 self.f, self.cfg, self.root, self.results, self.sessions,
                 "FILE: {filename}\n{file_content}",
-                prompt_hash_value="phash", timeout=60,
+                prompt_hash_value="phash", timeout=60, thinking="off",
             )
         self.assertEqual(result["status"], "ok")
         mock_pi.assert_called_once()
@@ -759,11 +910,12 @@ class TestVerifyFindingMocked(unittest.TestCase):
         self.assertEqual(len(cache_files), 1)
 
     def test_cache_hit_skips_pi(self):
-        # Pre-populate the cache
+        # Pre-populate the cache. Key now includes thinking; the
+        # verify_finding default is "medium" so we seed with that.
         c_hash = ss.content_hash(self.f.read_bytes())
         f_sig = ss.findings_signature(self.findings)
         vph = ss.prompt_hash("prompt template")
-        key = ss.verify_file_key("code.py", "test", c_hash, f_sig, vph)
+        key = ss.verify_file_key("code.py", "test", c_hash, f_sig, vph, "medium")
         (self.verify_dir / f"{key}.json").write_text(json.dumps({
             "file": "code.py", "scanner": "test", "status": "ok",
             "verifications": {"1": {"confidence": "High"}},
@@ -774,7 +926,7 @@ class TestVerifyFindingMocked(unittest.TestCase):
             result = ss.verify_finding(
                 self.f, self.cfg, "code.py", self.findings,
                 self.root, self.verify_dir, self.sessions,
-                "prompt template", vph, timeout=60,
+                "prompt template", vph, timeout=60, thinking="medium",
             )
         self.assertEqual(result["status"], "cached")
         mock_pi.assert_not_called()
@@ -784,7 +936,7 @@ class TestVerifyFindingMocked(unittest.TestCase):
         c_hash = ss.content_hash(self.f.read_bytes())
         old_sig = ss.findings_signature([])
         vph = ss.prompt_hash("prompt template")
-        key = ss.verify_file_key("code.py", "test", c_hash, old_sig, vph)
+        key = ss.verify_file_key("code.py", "test", c_hash, old_sig, vph, "medium")
         (self.verify_dir / f"{key}.json").write_text(json.dumps({
             "file": "code.py", "scanner": "test", "status": "ok",
             "verifications": {}, "findings_signature": old_sig,
@@ -795,7 +947,7 @@ class TestVerifyFindingMocked(unittest.TestCase):
             ss.verify_finding(
                 self.f, self.cfg, "code.py", self.findings,
                 self.root, self.verify_dir, self.sessions,
-                "prompt template", vph, timeout=60,
+                "prompt template", vph, timeout=60, thinking="medium",
             )
         mock_pi.assert_called_once()
 
@@ -841,7 +993,7 @@ class TestVerifyFindingMocked(unittest.TestCase):
         c_hash = ss.content_hash(self.f.read_bytes())
         f_sig = ss.findings_signature(self.findings)
         vph = ss.prompt_hash("prompt template")
-        key = ss.verify_file_key("code.py", "test", c_hash, f_sig, vph)
+        key = ss.verify_file_key("code.py", "test", c_hash, f_sig, vph, "medium")
         (self.verify_dir / f"{key}.json").write_text(json.dumps({
             "file": "code.py", "scanner": "test", "status": "error",
             "error": "prior failure",
@@ -856,7 +1008,7 @@ class TestVerifyFindingMocked(unittest.TestCase):
             result = ss.verify_finding(
                 self.f, self.cfg, "code.py", self.findings,
                 self.root, self.verify_dir, self.sessions,
-                "prompt template", vph, timeout=60,
+                "prompt template", vph, timeout=60, thinking="medium",
             )
         self.assertEqual(result["status"], "ok")
         mock_pi.assert_called_once()
@@ -1562,7 +1714,7 @@ class TestCallPiToolArgs(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _args_for(self, tools):
+    def _args_for(self, tools=None, thinking=None):
         """Return the actual argv list that call_pi would invoke."""
         captured = {}
         def fake_run(cmd, *args, **kwargs):
@@ -1573,7 +1725,7 @@ class TestCallPiToolArgs(unittest.TestCase):
                 stderr = ""
             return R()
         with patch.object(ss.subprocess, "run", side_effect=fake_run):
-            ss.call_pi("hello", self.session, tools=tools)
+            ss.call_pi("hello", self.session, tools=tools, thinking=thinking)
         return captured["cmd"]
 
     def test_default_passes_no_tools(self):
@@ -1602,6 +1754,48 @@ class TestCallPiToolArgs(unittest.TestCase):
         cmd = self._args_for(tools=ss.READONLY_TOOLS)
         idx = cmd.index("--session-dir")
         self.assertEqual(cmd[idx + 1], str(self.session))
+
+    def test_thinking_default_omits_flag(self):
+        # `thinking=None` (the default) leaves --thinking out entirely so
+        # the user's pi config default applies. This keeps the historical
+        # "no extra flags" behavior when callers don't opt in.
+        cmd = self._args_for(tools=ss.READONLY_TOOLS)
+        self.assertNotIn("--thinking", cmd)
+
+    def test_thinking_off_omits_flag(self):
+        # `"off"` is the explicit-no-thinking path used by the scan phase
+        # by default. Same observable effect as `None`: no --thinking flag,
+        # so the model runs at its base speed.
+        cmd = self._args_for(thinking="off")
+        self.assertNotIn("--thinking", cmd)
+
+    def test_thinking_medium_passes_flag(self):
+        cmd = self._args_for(thinking="medium")
+        idx = cmd.index("--thinking")
+        self.assertEqual(cmd[idx + 1], "medium")
+
+    def test_thinking_high_passes_flag(self):
+        cmd = self._args_for(thinking="high")
+        idx = cmd.index("--thinking")
+        self.assertEqual(cmd[idx + 1], "high")
+
+    def test_thinking_invalid_returns_error(self):
+        # An unknown level should not silently pass through to pi (which
+        # would also reject it but with a less actionable message).
+        status, raw = ss.call_pi(
+            "hello", self.session, tools=None, thinking="bogus",
+        )
+        self.assertEqual(status, "error")
+        self.assertIn("invalid thinking level", raw)
+
+    def test_thinking_levels_constant_matches_pi(self):
+        # Keep the level set in sync with what `pi` actually accepts;
+        # drifting here produces confusing "invalid thinking level"
+        # errors at runtime.
+        self.assertEqual(
+            set(ss.VALID_THINKING_LEVELS),
+            {"off", "minimal", "low", "medium", "high", "xhigh"},
+        )
 
 
 class TestPhaseToolsCacheRouting(unittest.TestCase):
@@ -1752,6 +1946,131 @@ class TestPhaseToolsCacheRouting(unittest.TestCase):
             )
         self.assertEqual(mock.call_count, 1)
         self.assertEqual(mock.call_args.kwargs["tools"], ss.READONLY_TOOLS)
+
+    def test_scanner_forwards_thinking_to_call_pi(self):
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")) as mock:
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                tools=None, thinking="high",
+            )
+        self.assertEqual(mock.call_args.kwargs["thinking"], "high")
+
+    def test_scanner_default_thinking_is_off(self):
+        # The scan phase should default to "off" — enumeration doesn't
+        # need chain-of-thought, and this is the single biggest speedup.
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")) as mock:
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                tools=None,
+            )
+        self.assertEqual(mock.call_args.kwargs["thinking"], "off")
+
+    def test_verification_forwards_thinking_to_call_pi(self):
+        self._seed_scan_cache("results", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))) as mock:
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                tools=None, thinking="high",
+            )
+        self.assertEqual(mock.call_args.kwargs["thinking"], "high")
+
+    def test_verification_default_thinking_is_medium(self):
+        self._seed_scan_cache("results", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))) as mock:
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                tools=None,
+            )
+        self.assertEqual(mock.call_args.kwargs["thinking"], "medium")
+
+    def test_scan_cache_key_includes_thinking(self):
+        # Flipping --scan-thinking must produce a different cache key for
+        # the same file + prompt, otherwise the same cache file would be
+        # returned for two observably-different model behaviors.
+        c_hash = ss.content_hash((self.root / "code.py").read_bytes())
+        k_off = ss.file_key("code.py", "injection", c_hash, self.p_hash, "off")
+        k_high = ss.file_key("code.py", "injection", c_hash, self.p_hash, "high")
+        self.assertNotEqual(k_off, k_high)
+
+    def test_verify_cache_key_includes_thinking(self):
+        c_hash = ss.content_hash((self.root / "code.py").read_bytes())
+        f_sig = ss.findings_signature([{"line": 1, "code": "x"}])
+        k_medium = ss.verify_file_key("code.py", "injection", c_hash, f_sig, self.p_hash, "medium")
+        k_high = ss.verify_file_key("code.py", "injection", c_hash, f_sig, self.p_hash, "high")
+        self.assertNotEqual(k_medium, k_high)
+
+    def test_thinking_change_invalidates_scan_cache(self):
+        # End-to-end: a file scanned with thinking=off must be re-scanned
+        # when the user flips to thinking=high, even if file content
+        # and prompt are unchanged.
+        c_hash = ss.content_hash((self.root / "code.py").read_bytes())
+        key_off = ss.file_key("code.py", "injection", c_hash, self.p_hash, "off")
+        results_dir = self.state / "injection" / "results"
+        results_dir.mkdir(parents=True)
+        (results_dir / f"{key_off}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "injection", "status": "ok",
+            "result": [{"line": 1, "code": "x"}],
+            "content_hash": c_hash, "prompt_hash": self.p_hash,
+        }))
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")) as mock:
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                tools=None, thinking="high",
+            )
+        # The high-thinking run must have called pi; the off-thinking
+        # cache file does not satisfy its key.
+        self.assertEqual(mock.call_count, 1)
+
+    def test_thinking_change_invalidates_verify_cache(self):
+        c_hash = ss.content_hash((self.root / "code.py").read_bytes())
+        findings = [{"line": 1, "severity": "High", "code": "x",
+                     "explanation": "", "fix": ""}]
+        f_sig = ss.findings_signature(findings)
+        # Seed a verify cache for thinking=medium
+        key_medium = ss.verify_file_key(
+            "code.py", "injection", c_hash, f_sig, self.p_hash, "medium",
+        )
+        verify_dir = self.state / "injection" / "verifications"
+        verify_dir.mkdir(parents=True)
+        (verify_dir / f"{key_medium}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "injection", "status": "ok",
+            "verifications": {"1": {"confidence": "High"}},
+        }))
+        # Seed the scan results it needs to read
+        self._seed_scan_cache("results", findings)
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))) as mock:
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                tools=None, thinking="high",
+            )
+        self.assertEqual(mock.call_count, 1)
 
 
 class TestBuildReportToolsAnnotation(unittest.TestCase):
@@ -1910,6 +2229,136 @@ class TestToolsCLI(unittest.TestCase):
                      "--no-discovery-tools", "--no-scan-tools",
                      "--no-verify-tools"):
             self.assertIn(flag, proc.stdout)
+
+
+class TestThinkingCLI(unittest.TestCase):
+    """Smoke tests for --scan-thinking / --verify-thinking flags."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / ".security_scan"
+        (self.root / "code.py").write_text("x = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args, expect_exit=None, timeout=30):
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             *args],
+            cwd=str(self.root),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if expect_exit is not None:
+            self.assertEqual(
+                proc.returncode, expect_exit,
+                msg=f"Expected exit {expect_exit}, got {proc.returncode}\n"
+                    f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+        return proc
+
+    def test_help_lists_thinking_flags(self):
+        proc = self._run("--help")
+        for flag in ("--scan-thinking", "--verify-thinking"):
+            self.assertIn(flag, proc.stdout)
+
+    def test_invalid_thinking_level_rejected(self):
+        # argparse should reject levels outside the valid set before
+        # any pi call happens.
+        proc = self._run("--scanner", "B3", "--scan-thinking", "bogus")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("invalid choice", proc.stderr.lower())
+
+
+class TestMaxFileSizeCLI(unittest.TestCase):
+    """Smoke tests for the --max-file-size flag and its 1 MiB default."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / ".security_scan"
+        # One small file (~6 bytes) and one ~6 KB file. Both are well
+        # under the 1 MiB default, so a separate test creates a
+        # genuinely oversized file to exercise the default.
+        (self.root / "small.py").write_text("x = 1\n")
+        (self.root / "modest.py").write_text("x = 1\n" + "# pad\n" * 1000)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args, expect_exit=None, timeout=30):
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             *args],
+            cwd=str(self.root),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if expect_exit is not None:
+            self.assertEqual(
+                proc.returncode, expect_exit,
+                msg=f"Expected exit {expect_exit}, got {proc.returncode}\n"
+                    f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+        return proc
+
+    def test_help_lists_max_file_size(self):
+        proc = self._run("--help")
+        self.assertIn("--max-file-size", proc.stdout)
+        # Help text should mention the 1 MiB default so users can
+        # discover the cap without reading the README.
+        self.assertIn("1048576", proc.stdout)
+
+    def test_explicit_tight_limit_filters_in_dry_run(self):
+        # --max-file-size 100 is tighter than both files in setUp, so
+        # only the 6-byte file survives.
+        proc = self._run(
+            "--scanner", "B3", "--phase", "2", "--dry-run",
+            "--max-file-size", "100",
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertIn("Found 1 non-binary files", combined)
+        self.assertIn("Skipped 1 file(s) larger than 100 bytes", combined)
+
+    def test_default_1mib_keeps_normal_source_files(self):
+        # Both files in setUp are well under 1 MiB; the default
+        # leaves them alone and prints no skip line.
+        proc = self._run(
+            "--scanner", "B3", "--phase", "2", "--dry-run",
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertIn("Found 2 non-binary files", combined)
+        self.assertNotIn("Skipped", combined)
+
+    def test_default_1mib_filters_genuinely_oversized(self):
+        # Create a 2 MiB file alongside the small one. The default
+        # cap (1 MiB) must drop the 2 MiB file and report the skip.
+        (self.root / "huge.py").write_text(
+            "x = 1\n" + "# pad\n" * (2 * 1024 * 1024 // 8)
+        )
+        proc = self._run(
+            "--scanner", "B3", "--phase", "2", "--dry-run",
+        )
+        combined = proc.stdout + proc.stderr
+        # Two small files survive, one big file is dropped.
+        self.assertIn("Found 2 non-binary files", combined)
+        self.assertIn(f"Skipped 1 file(s) larger than {ss.DEFAULT_MAX_FILE_SIZE} bytes", combined)
+
+    def test_explicit_zero_disables_cap(self):
+        # --max-file-size 0 is the opt-out for repos with legitimately
+        # huge files. Even a 2 MiB file is kept.
+        (self.root / "huge.py").write_text(
+            "x = 1\n" + "# pad\n" * (2 * 1024 * 1024 // 8)
+        )
+        proc = self._run(
+            "--scanner", "B3", "--phase", "2", "--dry-run",
+            "--max-file-size", "0",
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertIn("Found 3 non-binary files", combined)
+        self.assertNotIn("Skipped", combined)
 
 
 # ── Progress tracker tests ───────────────────────────────────────────────────
@@ -2170,7 +2619,9 @@ class TestVerifyCachePreCheck(unittest.TestCase):
 
     def _write_scan_result(self, rel, vulns):
         c_hash = ss.content_hash((self.root / rel).read_bytes())
-        key = ss.file_key(rel, "injection", c_hash, self.p_hash)
+        # Cache key now includes thinking; the scan default is "off" so
+        # seed with that to match the keys the production path produces.
+        key = ss.file_key(rel, "injection", c_hash, self.p_hash, "off")
         rd = self.state / "injection" / "results"
         rd.mkdir(parents=True, exist_ok=True)
         (rd / f"{key}.json").write_text(json.dumps({
@@ -2185,9 +2636,10 @@ class TestVerifyCachePreCheck(unittest.TestCase):
         f_sig = ss.findings_signature(vulns)
         vph = ss.prompt_hash(ss.load_verify_prompt())
         # verify_file_key signature is (rel, scanner_name, content_hash,
-        # findings_sig, verify_prompt_hash) — must match what
-        # run_verification's pre-check uses.
-        key = ss.verify_file_key(rel, "injection", c_hash, f_sig, vph)
+        # findings_sig, verify_prompt_hash, thinking) — must match what
+        # run_verification's pre-check uses. Seed with "medium" to match
+        # the verify phase default.
+        key = ss.verify_file_key(rel, "injection", c_hash, f_sig, vph, "medium")
         vd = self.state / "injection" / "verifications"
         vd.mkdir(parents=True, exist_ok=True)
         (vd / f"{key}.json").write_text(json.dumps({
@@ -2310,6 +2762,30 @@ class TestVerifyCachePreCheck(unittest.TestCase):
         # The verify phase was never started in the tracker
         with tracker._lock:
             self.assertNotIn("verify", tracker._phases)
+
+    def test_size_limit_skips_oversized_stale_scan_result(self):
+        """A scan result cached for a file that has since grown past
+        --max-file-size must be skipped in the verify phase, not
+        silently re-read. This is the defensive re-check that pairs
+        with the discovery-time filter, catching files that became
+        oversized after the scan (or stale results from a previous
+        run that had no size limit)."""
+        vulns = [{"line": 1, "severity": "High", "code": "x",
+                  "explanation": "", "fix": ""}]
+        # Write a scan result for a.py, then grow the file past the limit
+        self._write_scan_result("a.py", vulns)
+        (self.root / "a.py").write_text("x = 1\n" + "# pad\n" * 1000)  # ~6 KB
+        # Verify with a 1 KB limit
+        with patch.object(ss, "call_pi") as mock_pi, \
+             patch("builtins.print"):
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                max_file_size=1024,
+            )
+        # pi was never called: the size check rejected the file
+        # before the cache pre-check (or verify_finding) could run.
+        self.assertEqual(mock_pi.call_count, 0)
 
 
 if __name__ == "__main__":

@@ -143,20 +143,47 @@ BINARY_EXTS = {
     ".cvsignore", ".super",
 }
 
+# Default per-file size cap. Files larger than this are dropped from
+# discovery (and defensively re-checked in verify) so the prompt never
+# carries multi-megabyte blobs the LLM can't reason about coherently.
+# 1 MiB catches most auto-generated bundles, vendored minified JS,
+# lockfiles, and generated protobufs while still fitting comfortably
+# in any modern model's context window. Pass `--max-file-size 0` to
+# disable the cap entirely; use a larger value for repos with
+# legitimately large hand-written files.
+DEFAULT_MAX_FILE_SIZE = 1 * 1024 * 1024
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
-def find_all_files(root: Path) -> tuple[list[Path], dict[str, list[Path]], dict[str, list[Path]]]:
+def find_all_files(
+    root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+) -> tuple[list[Path], dict[str, list[Path]], dict[str, list[Path]]]:
     """
     Walk the repo and collect:
       - all non-binary files
       - files grouped by extension
       - files grouped by well-known names
     Returns (all_files, ext_map, name_map).
+
+    `max_file_size` is an optional byte limit (default 1 MiB, see
+    `DEFAULT_MAX_FILE_SIZE`). Files larger than this are silently dropped
+    from the maps, which means they never reach the scan or verify phases.
+    This is the single chokepoint for the "ignore huge files" policy —
+    once a file is excluded here, no downstream code path will see it
+    (unless a stale scan result is loaded by name, in which case
+    `run_verification` re-checks the size defensively). Pass `0` to
+    disable the cap entirely.
+
+    When files are skipped due to the size limit, the count is printed
+    to stderr so the user can see what was filtered. The summary line
+    is suppressed when the limit is 0 (no filtering) or when nothing
+    matched the limit (no noise in the common case).
     """
     all_files = []
     ext_map: dict[str, list[Path]] = {}
     name_map: dict[str, list[Path]] = {}
+    size_skipped = 0
 
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune excluded dirs — match by basename or by full relative path prefix
@@ -178,6 +205,18 @@ def find_all_files(root: Path) -> tuple[list[Path], dict[str, list[Path]], dict[
             if ext in BINARY_EXTS:
                 continue
 
+            # Skip files that exceed the configured size limit. Check
+            # before the read-bytes sample below to avoid loading
+            # megabytes of a vendored blob just to drop it.
+            if max_file_size > 0:
+                try:
+                    size = filepath.stat().st_size
+                except OSError:
+                    continue
+                if size > max_file_size:
+                    size_skipped += 1
+                    continue
+
             # Skip files we can't read
             try:
                 sample = filepath.read_bytes()[:8192]
@@ -192,17 +231,32 @@ def find_all_files(root: Path) -> tuple[list[Path], dict[str, list[Path]], dict[
             ext_map.setdefault(ext, []).append(filepath)
             name_map.setdefault(fname, []).append(filepath)
 
+    if max_file_size > 0 and size_skipped > 0:
+        print(
+            f"[DISCOVERY] Skipped {size_skipped} file(s) larger than "
+            f"{max_file_size} bytes",
+            file=sys.stderr,
+        )
+
+    return all_files, ext_map, name_map
+
     return all_files, ext_map, name_map
 
 
-def file_key(rel_path: str, scanner_name: str, content_hash: str, prompt_hash: str) -> str:
-    """Cache key = scanner + rel path + content hash + prompt hash.
+def file_key(
+    rel_path: str, scanner_name: str, content_hash: str, prompt_hash: str,
+    thinking: str = "",
+) -> str:
+    """Cache key = scanner + rel path + content hash + prompt hash + thinking.
 
     Including content and prompt hashes invalidates the cache when either
     changes, so a modified file or an edited prompt template forces a re-scan.
+    Thinking is included so that flipping `--scan-thinking` produces a
+    distinct cache namespace; the same scan run with `off` vs `medium` is
+    observably different model behavior and should not be cached interchangeably.
     """
     return hashlib.md5(
-        f"{scanner_name}:{rel_path}:{content_hash}:{prompt_hash}".encode()
+        f"{scanner_name}:{rel_path}:{content_hash}:{prompt_hash}:{thinking}".encode()
     ).hexdigest()
 
 
@@ -230,56 +284,350 @@ def findings_signature(findings: list[dict]) -> str:
 def verify_file_key(
     rel: str, scanner_name: str, content_hash_value: str,
     findings_sig: str, verify_prompt_hash_value: str,
+    thinking: str = "",
 ) -> str:
     """Cache key for a per-file verification result.
 
     Keyed on (scanner, file path, file content hash, findings signature,
-    verify-prompt hash) so a change to any of those inputs re-runs verification.
-    The findings signature is the link that keeps verification in sync with
-    phase 2: a new vuln or a changed finding invalidates the verification.
+    verify-prompt hash, thinking) so a change to any of those inputs
+    re-runs verification. The findings signature is the link that keeps
+    verification in sync with phase 2: a new vuln or a changed finding
+    invalidates the verification. Thinking is included so flipping
+    `--verify-thinking` produces a distinct cache namespace.
     """
     return hashlib.md5(
         f"verify:{scanner_name}:{rel}:{content_hash_value}:"
-        f"{findings_sig}:{verify_prompt_hash_value}".encode()
+        f"{findings_sig}:{verify_prompt_hash_value}:{thinking}".encode()
     ).hexdigest()
 
 
-def extract_json_array(raw_text: str) -> object:
-    """Best-effort extraction of a JSON array from model output text."""
-    text = raw_text.strip()
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        pass
+def _strip_code_fences(text: str) -> str:
+    """Strip ```json ... ``` / ``` ... ``` fences from model output.
 
-    match = re.search(r"\[[\s\S]*\]", text)
-    if match:
+    Models frequently wrap JSON in fences even when not asked to. The naive
+    `json.loads(fenced_text)` fails because of the leading ``` line, so we
+    peel the outermost fence pair off if present. Anything that doesn't
+    look like a fence is returned unchanged.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    # Drop the opening fence line (``` or ```json / ```python / etc.)
+    first_nl = stripped.find("\n")
+    if first_nl == -1:
+        return stripped
+    body = stripped[first_nl + 1:]
+    # Drop the closing ``` if present
+    if body.rstrip().endswith("```"):
+        body = body.rstrip()[:-3].rstrip()
+    return body
+
+
+def _try_parse_json_array(text: str) -> object | None:
+    """Attempt to parse `text` as a JSON array using `raw_decode`.
+
+    `json.JSONDecoder.raw_decode` is the right tool here: it scans for the
+    next valid JSON value starting at a given offset and returns both the
+    value and the offset where parsing ended. This means we don't have to
+    regex-match brackets (which over-matches on prose containing `[`/`]`)
+    and we naturally accept trailing prose after the JSON.
+
+    We try every `[` position in the text, not just the first. Models
+    often mention things like "the array `[1,2,3]`" in their reasoning
+    before producing the real JSON; taking the first `[` would chase that
+    stray reference and miss the real output. The first `[` whose
+    `raw_decode` succeeds with a list is the answer.
+
+    Returns the parsed value on success, or None on any parse error.
+    """
+    decoder = json.JSONDecoder()
+    n = len(text)
+    # Try whole-response parse first (fast path).
+    idx = 0
+    while idx < n and text[idx] in " \t\r\n":
+        idx += 1
+    if idx < n:
         try:
-            return json.loads(match.group())
+            value, _ = decoder.raw_decode(text, idx)
+            if isinstance(value, list):
+                return value
         except (json.JSONDecodeError, ValueError):
             pass
+    # Try each `[` position in order.
+    search_from = 0
+    while True:
+        bracket = text.find("[", search_from)
+        if bracket == -1:
+            return None
+        try:
+            value, _ = decoder.raw_decode(text, bracket)
+        except (json.JSONDecodeError, ValueError):
+            search_from = bracket + 1
+            continue
+        if isinstance(value, list):
+            return value
+        search_from = bracket + 1
 
-    if "NO_VULNERABILITIES" in text.upper():
+
+def _try_recover_truncated_array(text: str) -> list | None:
+    """Last-ditch recovery: if the model produced a truncated JSON array
+    (e.g. it ran out of output tokens mid-list), try to parse the longest
+    prefix that ends with a complete top-level object, then `]`.
+
+    Walks the text tracking string/object/array depth so we can find every
+    position where the array could legitimately be closed: after each
+    top-level `}` (object end) and after each top-level `,` (mid-list, if
+    the next object is the truncation point). At each candidate position
+    we attempt to parse `prefix + "]"`. Returns the longest successful
+    parse, or None.
+    """
+    decoder = json.JSONDecoder()
+    open_idx = text.find("[")
+    if open_idx == -1:
+        return None
+    n = len(text)
+    best: list | None = None
+    i = open_idx + 1
+    array_depth = 1
+    obj_depth = 0
+    in_string = False
+    escape = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "[":
+            array_depth += 1
+        elif ch == "]":
+            array_depth -= 1
+            if array_depth == 0:
+                # The array is already complete here; this path shouldn't
+                # be hit because _try_parse_json_array would have caught
+                # it, but bail cleanly if it is.
+                return None
+        elif ch == "{":
+            obj_depth += 1
+        elif ch == "}":
+            obj_depth -= 1
+            if array_depth == 1 and obj_depth == 0:
+                # End of a top-level object. Try closing the array.
+                candidate = text[open_idx:i + 1] + "]"
+                try:
+                    value, _ = decoder.raw_decode(candidate)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                else:
+                    if isinstance(value, list):
+                        best = value
+        elif ch == "," and array_depth == 1 and obj_depth == 0:
+            # Top-level comma — also a valid place to close the array
+            # (the next object is missing because of truncation).
+            candidate = text[open_idx:i] + "]"
+            try:
+                value, _ = decoder.raw_decode(candidate)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            else:
+                if isinstance(value, list):
+                    best = value
+        i += 1
+    return best
+
+
+def extract_json_array(raw_text: str) -> object:
+    """Best-effort extraction of a JSON array from model output text.
+
+    Tries, in order:
+      1. `json.loads(stripped)` of the whole response.
+      2. `raw_decode` after stripping ```json / ``` fences.
+      3. `raw_decode` from the first `[` (handles leading prose / reasoning).
+      4. Truncated-array recovery (handles output-token cutoffs).
+      5. Prose fallback: explicit "no vulnerabilities" markers → `[]`.
+      6. Error dict with a raw preview for the report overlay.
+
+    The previous implementation used `re.search(r"\\[.*?\\]", text)`-style
+    greedy matching, which over-matches when prose contains bracket chars
+    and silently drops findings on any parse error. The new path is
+    anchored on the JSON parser's own state machine, so a malformed but
+    recoverable response surfaces findings instead of becoming a black hole.
+    """
+    text = raw_text.strip()
+    if not text:
+        return {"error": "empty response", "raw_preview": ""}
+
+    # 1) Whole response as-is.
+    parsed = _try_parse_json_array(text)
+    if parsed is not None:
+        return parsed
+
+    # 2) After stripping ``` fences.
+    unfenced = _strip_code_fences(text)
+    if unfenced != text:
+        parsed = _try_parse_json_array(unfenced)
+        if parsed is not None:
+            return parsed
+
+    # 3) raw_decode from the first `[` (handles leading prose).
+    bracket = text.find("[")
+    if bracket != -1:
+        parsed = _try_parse_json_array(text[bracket:])
+        if parsed is not None:
+            return parsed
+
+    # 4) Truncated-array recovery.
+    recovered = _try_recover_truncated_array(text)
+    if recovered is not None:
+        return recovered
+
+    # 5) Prose fallback for "no findings" markers.
+    upper = text.upper()
+    if "NO_VULNERABILITIES" in upper or "NO VULNERABILITIES" in upper:
+        return []
+    if "NO_FINDINGS" in upper or "NO FINDINGS" in upper:
+        return []
+    if "EMPTY_ARRAY" in upper or "EMPTY ARRAY" in upper:
         return []
 
+    # 6) Final error: include enough context to debug, but cap the size
+    # so a runaway response doesn't bloat the cache file.
     return {"error": "could not parse JSON from response", "raw_preview": text[:2000]}
 
 
-def extract_json_object(raw_text: str) -> object:
-    """Best-effort extraction of a JSON object from model output text."""
-    text = raw_text.strip()
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        pass
+def _try_parse_json_object(text: str) -> object | None:
+    """Attempt to parse `text` as a JSON object using `raw_decode`.
 
-    # Try to find {...} in the text
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
+    Mirrors `_try_parse_json_array`: tries every `{` position in the
+    text so prose that contains a stray `{` (e.g. an example in the
+    model's reasoning) doesn't shadow the real output. Returns the
+    first parseable object, or None.
+    """
+    decoder = json.JSONDecoder()
+    n = len(text)
+    idx = 0
+    while idx < n and text[idx] in " \t\r\n":
+        idx += 1
+    if idx < n:
         try:
-            return json.loads(match.group())
+            value, _ = decoder.raw_decode(text, idx)
+            if isinstance(value, dict):
+                return value
         except (json.JSONDecodeError, ValueError):
             pass
+    search_from = 0
+    while True:
+        brace = text.find("{", search_from)
+        if brace == -1:
+            return None
+        try:
+            value, _ = decoder.raw_decode(text, brace)
+        except (json.JSONDecodeError, ValueError):
+            search_from = brace + 1
+            continue
+        if isinstance(value, dict):
+            return value
+        search_from = brace + 1
+
+
+def _try_recover_truncated_object(text: str) -> object | None:
+    """Last-ditch recovery for a truncated JSON object.
+
+    For each `{` position in the text, walks forward tracking string and
+    bracket depth. At every position where the object could legitimately
+    be closed (top-level `,` or `}`) and the prefix is parseable, we
+    attempt to close the object with `}` and return the longest valid
+    parse.
+    """
+    decoder = json.JSONDecoder()
+    n = len(text)
+    best: object | None = None
+    # Try every `{` so prose with a stray `{` doesn't shadow the real
+    # output (mirrors `_try_parse_json_object`).
+    open_idx = -1
+    while True:
+        open_idx = text.find("{", open_idx + 1)
+        if open_idx == -1:
+            break
+        i = open_idx + 1
+        obj_depth = 1
+        in_string = False
+        escape = False
+        while i < n:
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                i += 1
+                continue
+            if ch == '"':
+                in_string = True
+                i += 1
+                continue
+            if ch == "{":
+                obj_depth += 1
+            elif ch == "}":
+                obj_depth -= 1
+                if obj_depth == 0:
+                    # Object closes cleanly here. raw_decode should
+                    # have caught this; if not, take it and return.
+                    try:
+                        value, _ = decoder.raw_decode(text[open_idx:i + 1])
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    else:
+                        if isinstance(value, dict):
+                            return value
+            elif ch == "," and obj_depth == 1:
+                # Top-level comma — also a valid close point for
+                # truncation. Try `prefix + "}"`.
+                candidate = text[open_idx:i] + "}"
+                try:
+                    value, _ = decoder.raw_decode(candidate)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                else:
+                    if isinstance(value, dict):
+                        best = value
+            i += 1
+    return best
+
+
+def extract_json_object(raw_text: str) -> object:
+    """Best-effort extraction of a JSON object from model output text.
+
+    Same robustness pass as `extract_json_array`: whole-response parse,
+    code-fence strip, raw_decode from each `{` position, and truncated-
+    object recovery. Returns an error dict on failure.
+    """
+    text = raw_text.strip()
+    if not text:
+        return {"error": "empty response", "raw_preview": ""}
+
+    parsed = _try_parse_json_object(text)
+    if parsed is not None:
+        return parsed
+
+    unfenced = _strip_code_fences(text)
+    if unfenced != text:
+        parsed = _try_parse_json_object(unfenced)
+        if parsed is not None:
+            return parsed
+
+    recovered = _try_recover_truncated_object(text)
+    if recovered is not None:
+        return recovered
 
     return {"error": "could not parse JSON from response", "raw_preview": text[:2000]}
 
@@ -291,11 +639,15 @@ def extract_json_object(raw_text: str) -> object:
 READONLY_TOOLS = ["read", "grep", "find", "ls"]
 
 
+VALID_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
+
+
 def call_pi(
     prompt: str,
     session_dir: Path,
     timeout: int = 180,
     tools: list[str] | None = None,
+    thinking: str | None = None,
 ) -> tuple[str, str]:
     """
     Call `pi -p` with the given prompt.
@@ -308,6 +660,17 @@ def call_pi(
     - A non-empty list (e.g. `READONLY_TOOLS`) drops `--no-tools` and adds
       `--tools <comma-joined>`, allowing the model to read files, search,
       and so on within whatever allowlist the caller chose.
+
+    `thinking` controls the model's reasoning effort via `pi --thinking`.
+    - `None` (default) omits the flag entirely and inherits the user's
+      `pi` config default — useful when the caller wants pi's global
+      setting to apply.
+    - `"off"` also omits the flag (same as `None`) but is explicit; this
+      is the right choice for the recall/scan phase where enumeration
+      doesn't need chain-of-thought and the speedup is significant.
+    - Any value in `VALID_THINKING_LEVELS` is passed through as
+      `--thinking <level>`. The verify phase uses `"medium"` by default
+      because per-finding judgment benefits from reasoning.
     """
     # Write prompt to temp file to avoid argument length limits
     tmp_fd = None
@@ -323,6 +686,10 @@ def call_pi(
             cmd.extend(["--tools", ",".join(tools)])
         else:
             cmd.append("--no-tools")
+        if thinking and thinking != "off":
+            if thinking not in VALID_THINKING_LEVELS:
+                return "error", f"invalid thinking level: {thinking!r}"
+            cmd.extend(["--thinking", thinking])
         cmd.extend([
             "--no-session", "--mode", "text",
             "--session-dir", str(session_dir), f"@{tmp_path}",
@@ -798,12 +1165,13 @@ def verify_finding(
     timeout: int = 300,
     force: bool = False,
     tools: list[str] | None = None,
+    thinking: str = "medium",
 ) -> dict:
     """Verify a single file's findings: ask the model to rate each finding's
     confidence and exploitability in the context of the file as written.
 
     Caches the per-(scanner, file) verification result; cache key invalidates
-    when file content, findings list, or verify prompt changes.
+    when file content, findings list, verify prompt, or thinking level changes.
 
     Failed verifications (pi error or timeout) are NOT cached. Any
     pre-existing failed cache entry for this key is removed before the
@@ -814,6 +1182,12 @@ def verify_finding(
     finding — the cross-file judgment that makes the verify phase
     worthwhile. The cache lives under `verify_dir`, which the caller picks
     so tools-mode and no-tools-mode verdicts never share a path.
+
+    `thinking` defaults to `"medium"` because per-finding judgment
+    (reachability, sanitization, exploitability) benefits from chain-of-
+    thought. Pass `"off"` to disable or one of `VALID_THINKING_LEVELS` to
+    scale. The cache key includes thinking so different levels never
+    share a verdict.
     """
     try:
         raw_bytes = filepath.read_bytes()
@@ -825,7 +1199,9 @@ def verify_finding(
 
     c_hash = content_hash(raw_bytes)
     f_sig = findings_signature(findings)
-    key = verify_file_key(rel, scanner_cfg["name"], c_hash, f_sig, verify_prompt_hash_value)
+    key = verify_file_key(
+        rel, scanner_cfg["name"], c_hash, f_sig, verify_prompt_hash_value, thinking,
+    )
     cache_file = verify_dir / f"{key}.json"
 
     if not force and _cache_usable(cache_file):
@@ -847,7 +1223,7 @@ def verify_finding(
         }
 
     print(f"[VERIFY] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
-    status, raw = call_pi(prompt, session_dir, timeout=timeout, tools=tools)
+    status, raw = call_pi(prompt, session_dir, timeout=timeout, tools=tools, thinking=thinking)
 
     if status != "ok":
         parsed: object = {"error": raw[:2000]}
@@ -921,6 +1297,8 @@ def run_verification(
     verify_timeout: int = 300,
     tools: list[str] | None = None,
     scan_uses_tools: bool = False,
+    thinking: str = "medium",
+    max_file_size: int = DEFAULT_MAX_FILE_SIZE,
     progress: "ProgressTracker | None" = None,
 ) -> tuple[dict, list[dict]]:
     """Phase 3: Verify findings for every file that has at least one finding
@@ -937,6 +1315,18 @@ def run_verification(
       from the same dir the scan wrote to, so this is a separate flag —
       you can run with `--scan-tools` off and `--verify-tools` on, and
       the verifier still finds the scan output in `results/`.
+
+    `thinking` controls `pi --thinking` for every file in this verify
+    pass. Defaults to `"medium"` — per-finding judgment benefits from
+    chain-of-thought. The cache key includes thinking so different
+    levels never share a verdict.
+
+    `max_file_size` is a defensive re-check of the same size limit
+    applied at discovery. Stale scan results (cached before the user
+    set a size limit, or for files that have grown since the scan) are
+    skipped here so the verify phase doesn't try to read megabytes
+    into the prompt. Default 1 MiB (see `DEFAULT_MAX_FILE_SIZE`); pass
+    `0` to disable.
     """
     results_dir = state_dir / scanner_cfg["name"] / (
         "results-tools" if scan_uses_tools else "results"
@@ -984,6 +1374,23 @@ def run_verification(
             print(f"[WARN] Skipping verify of {rel}: file no longer exists", file=sys.stderr)
             continue
 
+        # Defensive size re-check: a file scanned in a previous run
+        # (before --max-file-size was set) may have grown since, or the
+        # user may have tightened the limit. Re-apply it here so the
+        # verify phase doesn't try to read megabytes into the prompt.
+        if max_file_size > 0:
+            try:
+                size = filepath.stat().st_size
+            except OSError:
+                continue
+            if size > max_file_size:
+                print(
+                    f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}: "
+                    f"file is {size} bytes, exceeds --max-file-size={max_file_size}",
+                    file=sys.stderr,
+                )
+                continue
+
         # Pre-check the verification cache. Reading the file here is
         # duplicated work for uncached files (verify_finding reads it
         # again) but the cost is one filesystem hit per file — negligible
@@ -994,11 +1401,11 @@ def run_verification(
                 c_hash = content_hash(raw_bytes)
                 f_sig = findings_signature(vulns)
                 # verify_file_key signature is (rel, scanner_name, content_hash,
-                # findings_sig, verify_prompt_hash) — must match what
+                # findings_sig, verify_prompt_hash, thinking) — must match what
                 # verify_finding uses, or the pre-check silently misses
                 # every cache hit.
                 v_key = verify_file_key(
-                    rel, scanner_cfg["name"], c_hash, f_sig, v_prompt_hash,
+                    rel, scanner_cfg["name"], c_hash, f_sig, v_prompt_hash, thinking,
                 )
                 # Treat stale failed cache entries as misses so a prior
                 # timeout/error gets retried on the next run instead of
@@ -1018,7 +1425,8 @@ def run_verification(
     print(f" Verification: {scanner_cfg['id']} - {scanner_cfg['label']}")
     print(f"{'=' * 60}")
     mode_label = "read-only tools" if tools else "no tools"
-    print(f"  Mode: {mode_label}")
+    thinking_label = f", thinking={thinking}" if thinking else ""
+    print(f"  Mode: {mode_label}{thinking_label}")
     total_with_findings = len(files_to_verify) + cached_count
     if cached_count and not reverify:
         print(f"  Files with findings: {total_with_findings} "
@@ -1042,7 +1450,7 @@ def run_verification(
             executor.submit(
                 verify_finding, fp, scanner_cfg, rel, vulns, repo_root,
                 verify_dir, session_dir, verify_template, v_prompt_hash,
-                verify_timeout, reverify, tools,
+                verify_timeout, reverify, tools, thinking,
             ): (fp, rel)
             for fp, rel, vulns in files_to_verify
         }
@@ -1113,6 +1521,7 @@ def scan_file(
     timeout: int = 180,
     force: bool = False,
     tools: list[str] | None = None,
+    thinking: str = "off",
 ) -> dict:
     """Scan a single file with a given scanner and cache the result.
 
@@ -1123,6 +1532,13 @@ def scan_file(
     `tools` is forwarded to `call_pi`. The cache file lives under
     `results_dir`, which the caller (run_scanner) picks so tools-mode and
     no-tools-mode results never share a path.
+
+    `thinking` defaults to `"off"` because the scan phase is high-recall
+    pattern enumeration — chain-of-thought adds latency and cost without
+    recall benefit when the model already has the whole file inline. Pass
+    one of `VALID_THINKING_LEVELS` to enable reasoning, or `None` to
+    inherit the user's `pi` default. The cache key includes thinking so
+    different levels never share a result.
     """
     rel = str(filepath.relative_to(repo_root))
 
@@ -1139,7 +1555,7 @@ def scan_file(
         }
 
     c_hash = content_hash(raw_bytes)
-    key = file_key(rel, scanner_cfg["name"], c_hash, prompt_hash_value)
+    key = file_key(rel, scanner_cfg["name"], c_hash, prompt_hash_value, thinking)
     cache_file = results_dir / f"{key}.json"
 
     if not force and _cache_usable(cache_file):
@@ -1161,7 +1577,7 @@ def scan_file(
             "result": {"error": f"prompt_format_failed: {e}"},
         }
 
-    status, raw = call_pi(prompt, session_dir, timeout=timeout, tools=tools)
+    status, raw = call_pi(prompt, session_dir, timeout=timeout, tools=tools, thinking=thinking)
 
     if status != "ok":
         parsed = {"error": raw[:2000]}
@@ -1212,6 +1628,7 @@ def run_scanner(
     format_override: list[str] | None = None,
     scan_timeout: int = 180,
     tools: list[str] | None = None,
+    thinking: str = "off",
     progress: "ProgressTracker | None" = None,
 ) -> tuple[dict, list[dict]]:
     """Run a single OWASP scanner across relevant files.
@@ -1220,6 +1637,11 @@ def run_scanner(
     `<scanner>/results-tools/` (sibling of the no-tools `results/` dir) so
     the two modes never collide and can be toggled without invalidating
     each other.
+
+    `thinking` controls `pi --thinking` for every file in this scan. The
+    cache key includes thinking, so flipping it (e.g. via `--scan-thinking`)
+    cleanly re-scans rather than reusing verdicts from a different model
+    setting.
     """
     results_dir = state_dir / scanner_cfg["name"] / (
         "results-tools" if tools else "results"
@@ -1245,8 +1667,9 @@ def run_scanner(
 
     # Filter to files whose content has changed since the cached result.
     # A cache entry is valid when (a) it exists, (b) its content_hash matches
-    # the current file content, and (c) its prompt_hash matches the current
-    # prompt template. --rescan skips this check entirely.
+    # the current file content, (c) its prompt_hash matches the current
+    # prompt template, and (d) its thinking level matches the current
+    # --scan-thinking. --rescan skips this check entirely.
     pending = []
     for f in target_files:
         if rescan:
@@ -1259,7 +1682,9 @@ def run_scanner(
             # (scan_file no longer caches failures).
             pending.append(f)
             continue
-        key = file_key(str(f.relative_to(repo_root)), scanner_cfg["name"], c_hash, p_hash)
+        key = file_key(
+            str(f.relative_to(repo_root)), scanner_cfg["name"], c_hash, p_hash, thinking,
+        )
         # Treat stale failed cache entries as misses so a prior
         # timeout/error gets retried on the next run instead of
         # blocking the file forever.
@@ -1276,7 +1701,8 @@ def run_scanner(
     print(f"{'=' * 60}")
     print(f"  Extensions: {', '.join(extensions)}")
     mode_label = "read-only tools" if tools else "no tools"
-    print(f"  Mode: {mode_label}")
+    thinking_label = f", thinking={thinking}" if thinking else ""
+    print(f"  Mode: {mode_label}{thinking_label}")
     print(f"  Files total: {len(target_files)} | Cached: {already_cached} | To scan: {len(pending)}")
 
     if dry_run:
@@ -1295,7 +1721,7 @@ def run_scanner(
         futures = {
             executor.submit(
                 scan_file, f, scanner_cfg, repo_root, results_dir, session_dir,
-                prompt_template, p_hash, scan_timeout, rescan, tools,
+                prompt_template, p_hash, scan_timeout, rescan, tools, thinking,
             ): f
             for f in pending
         }
@@ -2343,6 +2769,27 @@ OWASP 2025 Categories:
              "tools by default and may chase callers/sanitizers across files.",
     )
     parser.add_argument(
+        "--scan-thinking",
+        choices=list(VALID_THINKING_LEVELS),
+        default="off",
+        help="Reasoning effort for the scan phase (default: off). The scan "
+             "phase is high-recall pattern enumeration; the model already "
+             "has the whole file inline, so chain-of-thought adds latency "
+             "and cost without recall benefit. Set to 'low'/'medium' if a "
+             "particular scanner needs more careful analysis. Cache key "
+             "includes this value — flipping it forces a re-scan.",
+    )
+    parser.add_argument(
+        "--verify-thinking",
+        choices=list(VALID_THINKING_LEVELS),
+        default="medium",
+        help="Reasoning effort for the verify phase (default: medium). Per-"
+             "finding judgment (reachability, sanitization, exploitability) "
+             "benefits from chain-of-thought. Set to 'high' for the most "
+             "careful verdicts, or 'off' for the fastest pass. Cache key "
+             "includes this value — flipping it forces re-verification.",
+    )
+    parser.add_argument(
         "--discovery-tools",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2372,6 +2819,18 @@ OWASP 2025 Categories:
         help="Show an in-place stderr progress line with per-phase counters "
              "and ETA. Default: on. Disable with --no-progress for quiet CI "
              "logs or batch runs.",
+    )
+    parser.add_argument(
+        "--max-file-size",
+        type=int,
+        default=DEFAULT_MAX_FILE_SIZE,
+        help="Skip files larger than this many bytes during discovery. "
+             "Oversized files are also skipped in subsequent phases "
+             "(defensive re-check in verify). Default: 1048576 (1 MiB), "
+             "which catches auto-generated bundles, vendored minified JS, "
+             "lockfiles, and generated protobufs while fitting comfortably "
+             "in any modern model's context window. Set to 0 to disable "
+             "the cap entirely for repos with legitimately large files.",
     )
     parser.add_argument(
         "--fail-on-confidence",
@@ -2469,7 +2928,9 @@ OWASP 2025 Categories:
 
     # ── Discover files ──
     print("Discovering files...")
-    all_files, ext_map, name_map = find_all_files(repo_root)
+    all_files, ext_map, name_map = find_all_files(
+        repo_root, max_file_size=args.max_file_size,
+    )
     ext_summary = sorted(ext_map.items(), key=lambda x: -len(x[1]))[:15]
     print(f"Found {len(all_files)} non-binary files across {len(ext_map)} extensions:")
     for ext, files in ext_summary:
@@ -2534,6 +2995,7 @@ OWASP 2025 Categories:
                     format_override=format_override,
                     scan_timeout=args.scan_timeout,
                     tools=phase_tool_lists["scan"],
+                    thinking=args.scan_thinking,
                     progress=progress,
             )
             all_results.extend(results)
@@ -2572,6 +3034,8 @@ OWASP 2025 Categories:
                         verify_timeout=args.verify_timeout,
                         tools=phase_tool_lists["verify"],
                         scan_uses_tools=phase_tools["scan"],
+                        thinking=args.verify_thinking,
+                        max_file_size=args.max_file_size,
                         progress=progress,
                     )
                     # Verification results are read back from disk in build_report

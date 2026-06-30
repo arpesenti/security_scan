@@ -17,6 +17,12 @@ to rate each finding's confidence and exploitability in the context of the file 
 - Per-phase **read-only tool support** (`--discovery-tools` / `--scan-tools` / `--verify-tools`)
   so the model can inspect related files (callers, sanitizers, auth middleware) when
   making judgments
+- **Per-phase reasoning control** (`--scan-thinking` / `--verify-thinking`) — scan defaults
+  to off (enumeration doesn't need chain-of-thought, big speedup); verify defaults to
+  medium (per-finding judgment benefits from reasoning)
+- **Configurable file size limit** (`--max-file-size`) — exclude oversized files (auto-
+  generated bundles, vendored minified JS, lockfiles) from discovery and all subsequent
+  phases
 - **In-place progress line** with per-phase count + rate + ETA, on stderr, TTY-aware
   (`--no-progress` to silence)
 - Concurrent scans (`--concurrency`)
@@ -192,6 +198,21 @@ cannot execute, edit, write, or fetch.
 | Scan | **off** | `--scan-tools` / `--no-scan-tools` | Scan is high-recall single-file pattern matching. Tools add cost (5-10× per file) and a prompt-injection surface on every file read. Off by default; opt in for high-stakes scans. |
 | Verify | **on** | `--verify-tools` / `--no-verify-tools` | The whole reason verify exists is to do cross-file judgment — is this input sanitized upstream, is this function only called from tests, does the auth middleware already cover this route. With tools, the model can actually look. Off disables for the original file-as-written verifier. |
 
+## Per-phase reasoning control
+
+Each phase can be run with a different `pi --thinking` level. The same
+phases have different optimal settings:
+
+| Phase | Default | CLI flag | Why |
+|-------|---------|----------|-----|
+| Scan | `off` | `--scan-thinking <off\|minimal\|low\|medium\|high\|xhigh>` | Scan is high-recall pattern enumeration; the model already has the whole file inline, so chain-of-thought adds latency and cost without recall benefit. `off` skips the extra round-trips entirely. Use `low`/`medium` only if a particular scanner is producing shallow results and you want more careful analysis. |
+| Verify | `medium` | `--verify-thinking <level>` | Per-finding judgment (reachability, sanitization, exploitability) benefits from reasoning. `medium` is the default; `high` for the most careful verdicts, `off` for the fastest pass. |
+
+The cache key includes the thinking level, so flipping `--scan-thinking` or
+`--verify-thinking` produces a separate cache namespace and cleanly re-runs
+the affected phase rather than reusing verdicts from a different model
+behavior.
+
 Cache is split per phase × tools mode so toggling flags never invalidates
 the other mode's cache:
 
@@ -271,16 +292,21 @@ each is independently grep-able.
 | `--discovery-tools` / `--no-discovery-tools` | on | Give phase 1 (discovery) read-only tools (`read`,`grep`,`find`,`ls`). The model can browse the repo before deciding which extensions matter. |
 | `--scan-tools` / `--no-scan-tools` | off | Give phase 2 (scan) read-only tools. Off by default — scan is high-recall single-file; tools add cost and prompt-injection surface. |
 | `--verify-tools` / `--no-verify-tools` | on | Give phase 3 (verify) read-only tools. The model can read related files (callers, sanitizers, auth middleware) before rating each finding's confidence. |
+| `--scan-thinking LEVEL` | `off` | Reasoning effort for the scan phase: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. Scan is high-recall pattern enumeration; the model already has the whole file inline, so chain-of-thought adds latency without recall benefit. Cache key includes this value. |
+| `--verify-thinking LEVEL` | `medium` | Reasoning effort for the verify phase. Per-finding judgment benefits from chain-of-thought. Cache key includes this value. |
+| `--max-file-size BYTES` | `1048576` (1 MiB) | Skip files larger than this during discovery, so they're also skipped in scan and verify (defensive re-check). The default catches auto-generated bundles, vendored minified JS, lockfiles, and generated protobufs while fitting comfortably in any modern model's context window. Set to `0` to disable the cap entirely. |
 | `--progress` / `--no-progress` | on | Show an in-place stderr progress line with per-phase counts and ETA. Use `--no-progress` for quiet CI logs. |
 
 ## Cache invalidation
 
-Each cached result is keyed on `scanner + relative path + content hash + prompt hash`. A
+Each cached result is keyed on `scanner + relative path + content hash + prompt hash + thinking`. A
 re-scan is only triggered when **any** of those change:
 
 - The file's content has changed since the last scan (new vuln won't be missed)
 - The prompt template (`prompts/bN_*.txt`) was edited (stricter checks take effect immediately)
 - You changed the `--formats` override or the scanner's `base_ext` (a new key dimension)
+- You changed `--scan-thinking` or `--verify-thinking` (a different model behavior; the
+  cache must be regenerated for the new setting)
 
 `--rescan` bypasses this and re-scans every matching file. The discovery prompt
 (`prompts/discovery.txt`) and the scanner prompts are hashed independently, so editing one
