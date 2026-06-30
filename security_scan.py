@@ -766,13 +766,14 @@ def load_verify_prompt() -> str:
     return DEFAULT_VERIFY_PROMPT
 
 
-def _verify_cache_usable(cache_file: Path) -> bool:
-    """True if the cache file exists and holds a successful verification.
+def _cache_usable(cache_file: Path) -> bool:
+    """True if the cache file exists and holds a successful result.
 
-    Cache entries with status error/timeout are treated as misses so the
-    next run retries the verification rather than reusing a cached failure.
-    A corrupt or unreadable cache file also returns False (treated as miss)
-    so a transient disk error doesn't permanently block the file.
+    Used by both the scan and verify phases. Cache entries with status
+    error/timeout are treated as misses so the next run retries rather
+    than reusing a cached failure. A corrupt or unreadable cache file
+    also returns False (treated as miss) so a transient disk error
+    doesn't permanently block the file.
     """
     if not cache_file.exists():
         return False
@@ -827,7 +828,7 @@ def verify_finding(
     key = verify_file_key(rel, scanner_cfg["name"], c_hash, f_sig, verify_prompt_hash_value)
     cache_file = verify_dir / f"{key}.json"
 
-    if not force and _verify_cache_usable(cache_file):
+    if not force and _cache_usable(cache_file):
         print(f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
         return {"file": rel, "scanner": scanner_cfg["name"], "status": "cached"}
 
@@ -1002,7 +1003,7 @@ def run_verification(
                 # Treat stale failed cache entries as misses so a prior
                 # timeout/error gets retried on the next run instead of
                 # blocking the file forever.
-                if _verify_cache_usable(verify_dir / f"{v_key}.json"):
+                if _cache_usable(verify_dir / f"{v_key}.json"):
                     print(f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
                     cached_count += 1
                     continue
@@ -1115,6 +1116,10 @@ def scan_file(
 ) -> dict:
     """Scan a single file with a given scanner and cache the result.
 
+    Failed scans (pi error or timeout) are NOT cached. Any pre-existing
+    failed cache entry for this key is removed before the call so a
+    transient failure on one run is retried on the next.
+
     `tools` is forwarded to `call_pi`. The cache file lives under
     `results_dir`, which the caller (run_scanner) picks so tools-mode and
     no-tools-mode results never share a path.
@@ -1137,7 +1142,7 @@ def scan_file(
     key = file_key(rel, scanner_cfg["name"], c_hash, prompt_hash_value)
     cache_file = results_dir / f"{key}.json"
 
-    if not force and cache_file.exists():
+    if not force and _cache_usable(cache_file):
         print(f"[SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
         return {"file": rel, "scanner": scanner_cfg["name"], "status": "cached"}
 
@@ -1173,11 +1178,19 @@ def scan_file(
         "result": parsed if isinstance(parsed, (list, dict)) else {"error": "parse_error", "raw": str(parsed)[:2000]},
     }
 
-    tmp_path = cache_file.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(data))
-    shutil.move(str(tmp_path), str(cache_file))
-
-    if status != "ok":
+    if status == "ok":
+        tmp_path = cache_file.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data))
+        shutil.move(str(tmp_path), str(cache_file))
+    else:
+        # Don't cache failures. Remove any prior cache entry (including a
+        # stale failed one left by an older run) so the next run treats
+        # this file as a miss and retries the scan.
+        if cache_file.exists():
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
         print(f"[{status.upper()}] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
 
     return data
@@ -1242,11 +1255,15 @@ def run_scanner(
         try:
             c_hash = content_hash(f.read_bytes())
         except Exception:
-            # Unreadable now — re-scan so the new error is cached
+            # Unreadable now — re-scan so the new error is also retried
+            # (scan_file no longer caches failures).
             pending.append(f)
             continue
         key = file_key(str(f.relative_to(repo_root)), scanner_cfg["name"], c_hash, p_hash)
-        if not (results_dir / f"{key}.json").exists():
+        # Treat stale failed cache entries as misses so a prior
+        # timeout/error gets retried on the next run instead of
+        # blocking the file forever.
+        if not _cache_usable(results_dir / f"{key}.json"):
             pending.append(f)
 
     if max_files > 0 and len(pending) > max_files:

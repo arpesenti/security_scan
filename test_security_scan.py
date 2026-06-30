@@ -337,7 +337,20 @@ class TestScanFileMocked(unittest.TestCase):
         self.assertIn("prompt_format_failed", result["result"]["error"])
         mock_pi.assert_not_called()
 
-    def test_pi_error_cached(self):
+    def test_pi_error_does_not_write_cache(self):
+        # A failed pi call (non-ok status) must not leave a cache entry
+        # behind, otherwise the next run would skip the retry.
+        with self._patch_call(("error", "pi broke")):
+            result = ss.scan_file(
+                self.f, self.cfg, self.root, self.results, self.sessions,
+                "FILE: {filename}\n{file_content}",
+                prompt_hash_value="phash", timeout=60,
+            )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("pi broke", result["result"]["error"])
+        self.assertEqual(list(self.results.glob("*.json")), [])
+
+    def test_pi_timeout_does_not_write_cache(self):
         with self._patch_call(("timeout", "timed out")):
             result = ss.scan_file(
                 self.f, self.cfg, self.root, self.results, self.sessions,
@@ -345,8 +358,31 @@ class TestScanFileMocked(unittest.TestCase):
                 prompt_hash_value="phash", timeout=60,
             )
         self.assertEqual(result["status"], "timeout")
+        self.assertEqual(list(self.results.glob("*.json")), [])
+
+    def test_pi_error_removes_stale_failed_cache(self):
+        # A previous run left a failed cache entry. The next run must
+        # detect it as a miss, re-scan, and (on success) replace it —
+        # never reuse the cached failure.
+        c_hash = ss.content_hash(self.f.read_bytes())
+        key = ss.file_key("code.py", "test", c_hash, "phash")
+        (self.results / f"{key}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "test", "status": "error",
+            "result": {"error": "prior failure"},
+            "content_hash": c_hash, "prompt_hash": "phash",
+        }))
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")) as mock_pi:
+            result = ss.scan_file(
+                self.f, self.cfg, self.root, self.results, self.sessions,
+                "FILE: {filename}\n{file_content}",
+                prompt_hash_value="phash", timeout=60,
+            )
+        self.assertEqual(result["status"], "ok")
+        mock_pi.assert_called_once()
         cache_files = list(self.results.glob("*.json"))
         self.assertEqual(len(cache_files), 1)
+        cached = json.loads(cache_files[0].read_text())
+        self.assertEqual(cached["status"], "ok")
 
     def test_malformed_pi_response_cached_as_error(self):
         with self._patch_call(("ok", "no json here at all")):
