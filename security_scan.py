@@ -240,8 +240,6 @@ def find_all_files(
 
     return all_files, ext_map, name_map
 
-    return all_files, ext_map, name_map
-
 
 def file_key(
     rel_path: str, scanner_name: str, content_hash: str, prompt_hash: str,
@@ -257,6 +255,23 @@ def file_key(
     """
     return hashlib.md5(
         f"{scanner_name}:{rel_path}:{content_hash}:{prompt_hash}:{thinking}".encode()
+    ).hexdigest()
+
+
+def _legacy_scan_key(
+    rel_path: str, scanner_name: str, content_hash: str, prompt_hash: str,
+) -> str:
+    """Pre-thinking scan cache key.
+
+    One-time migration aid for caches built before the `--thinking` flag
+    was added to the cache key. The hash format is identical to `file_key`
+    but without the trailing `:thinking` field. Read lookups fall back to
+    this key via `_find_cache_file`; new writes always go to the new key.
+    Once the affected phase is re-run, the new file shadows the legacy one
+    and the fallback is no longer consulted.
+    """
+    return hashlib.md5(
+        f"{scanner_name}:{rel_path}:{content_hash}:{prompt_hash}".encode()
     ).hexdigest()
 
 
@@ -298,6 +313,26 @@ def verify_file_key(
     return hashlib.md5(
         f"verify:{scanner_name}:{rel}:{content_hash_value}:"
         f"{findings_sig}:{verify_prompt_hash_value}:{thinking}".encode()
+    ).hexdigest()
+
+
+def _legacy_verify_key(
+    rel: str, scanner_name: str, content_hash_value: str,
+    findings_sig: str, verify_prompt_hash_value: str,
+) -> str:
+    """Pre-thinking verify cache key.
+
+    One-time migration aid for caches built before the `--thinking` flag
+    was added to the cache key. The hash format is identical to
+    `verify_file_key` but without the trailing `:thinking` field. Read
+    lookups fall back to this key via `_find_cache_file`; new writes
+    always go to the new key. Once the affected phase is re-run, the
+    new file shadows the legacy one and the fallback is no longer
+    consulted.
+    """
+    return hashlib.md5(
+        f"verify:{scanner_name}:{rel}:{content_hash_value}:"
+        f"{findings_sig}:{verify_prompt_hash_value}".encode()
     ).hexdigest()
 
 
@@ -1152,6 +1187,35 @@ def _cache_usable(cache_file: Path) -> bool:
     return data.get("status") == "ok"
 
 
+def _find_cache_file(
+    cache_dir: Path, primary_key: str, legacy_key: str | None = None,
+) -> Path | None:
+    """Return the path of the first usable cache file, or None.
+
+    Checks the primary key (current format) first; if it doesn't have
+    a valid cache and `legacy_key` is provided, falls back to the
+    legacy key (pre-thinking format). The legacy fallback is a
+    one-time migration aid for caches built before the `--thinking`
+    flag was added to the cache key — those old keys are still
+    readable here, but every new write goes to the new key. Once the
+    affected phase is re-run, the new file shadows the legacy one
+    and the fallback is no longer consulted.
+
+    Returns the cache file path (which may be at the primary OR legacy
+    key) so callers can use the returned path for both status reporting
+    and skipping the work. New writes must still target the new key
+    directly — never write back to the legacy file.
+    """
+    new_file = cache_dir / f"{primary_key}.json"
+    if _cache_usable(new_file):
+        return new_file
+    if legacy_key:
+        legacy_file = cache_dir / f"{legacy_key}.json"
+        if _cache_usable(legacy_file):
+            return legacy_file
+    return None
+
+
 def verify_finding(
     filepath: Path,
     scanner_cfg: dict,
@@ -1202,11 +1266,18 @@ def verify_finding(
     key = verify_file_key(
         rel, scanner_cfg["name"], c_hash, f_sig, verify_prompt_hash_value, thinking,
     )
-    cache_file = verify_dir / f"{key}.json"
-
-    if not force and _cache_usable(cache_file):
+    # Legacy fallback: caches built before the --thinking flag was added
+    # to the cache key live at the pre-thinking key. The fallback is a
+    # one-time migration aid; new writes always go to the new key.
+    legacy_key = _legacy_verify_key(
+        rel, scanner_cfg["name"], c_hash, f_sig, verify_prompt_hash_value,
+    )
+    if not force and _find_cache_file(verify_dir, key, legacy_key) is not None:
         print(f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
         return {"file": rel, "scanner": scanner_cfg["name"], "status": "cached"}
+    # Write target is always the new key — never overwrite a legacy
+    # file (we want to shadow it on the next read, not stomp it).
+    cache_file = verify_dir / f"{key}.json"
 
     file_content = raw_bytes.decode("utf-8", errors="replace")
 
@@ -1407,10 +1478,17 @@ def run_verification(
                 v_key = verify_file_key(
                     rel, scanner_cfg["name"], c_hash, f_sig, v_prompt_hash, thinking,
                 )
+                # Legacy fallback: pre-thinking caches live at the
+                # pre-thinking key. Without this, a 4051-file verify
+                # pass would silently re-verify every file just because
+                # the key format changed.
+                legacy_v_key = _legacy_verify_key(
+                    rel, scanner_cfg["name"], c_hash, f_sig, v_prompt_hash,
+                )
                 # Treat stale failed cache entries as misses so a prior
                 # timeout/error gets retried on the next run instead of
                 # blocking the file forever.
-                if _cache_usable(verify_dir / f"{v_key}.json"):
+                if _find_cache_file(verify_dir, v_key, legacy_v_key) is not None:
                     print(f"[VERIFY-SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
                     cached_count += 1
                     continue
@@ -1489,8 +1567,14 @@ def load_verification_for_file(
     key = verify_file_key(
         rel, scanner_name, content_hash_value, f_sig, verify_prompt_hash_value,
     )
-    cache_file = verify_dir / f"{key}.json"
-    if not cache_file.exists():
+    # Legacy fallback: pre-thinking caches live at the pre-thinking key.
+    # Without this, the report would silently drop every verification
+    # verdict from a cache built before the --thinking flag.
+    legacy_key = _legacy_verify_key(
+        rel, scanner_name, content_hash_value, f_sig, verify_prompt_hash_value,
+    )
+    cache_file = _find_cache_file(verify_dir, key, legacy_key)
+    if cache_file is None:
         return None
     try:
         with open(cache_file) as f:
@@ -1556,11 +1640,18 @@ def scan_file(
 
     c_hash = content_hash(raw_bytes)
     key = file_key(rel, scanner_cfg["name"], c_hash, prompt_hash_value, thinking)
-    cache_file = results_dir / f"{key}.json"
-
-    if not force and _cache_usable(cache_file):
+    # Legacy fallback: caches built before the --thinking flag was added
+    # to the cache key live at the pre-thinking key. The fallback is a
+    # one-time migration aid; new writes always go to the new key.
+    legacy_key = _legacy_scan_key(
+        rel, scanner_cfg["name"], c_hash, prompt_hash_value,
+    )
+    if not force and _find_cache_file(results_dir, key, legacy_key) is not None:
         print(f"[SKIP] [{scanner_cfg['name']}] {rel}", file=sys.stderr)
         return {"file": rel, "scanner": scanner_cfg["name"], "status": "cached"}
+    # Write target is always the new key — never overwrite a legacy
+    # file (we want to shadow it on the next read, not stomp it).
+    cache_file = results_dir / f"{key}.json"
 
     file_content = raw_bytes.decode("utf-8", errors="replace")
 
@@ -1682,13 +1773,16 @@ def run_scanner(
             # (scan_file no longer caches failures).
             pending.append(f)
             continue
-        key = file_key(
-            str(f.relative_to(repo_root)), scanner_cfg["name"], c_hash, p_hash, thinking,
-        )
+        rel = str(f.relative_to(repo_root))
+        key = file_key(rel, scanner_cfg["name"], c_hash, p_hash, thinking)
+        # Legacy fallback: pre-thinking caches live at the pre-thinking
+        # key. Treat them as hits so a one-line prompt edit doesn't
+        # cascade into a 13-hour re-scan of every file.
+        legacy_key = _legacy_scan_key(rel, scanner_cfg["name"], c_hash, p_hash)
         # Treat stale failed cache entries as misses so a prior
         # timeout/error gets retried on the next run instead of
         # blocking the file forever.
-        if not _cache_usable(results_dir / f"{key}.json"):
+        if _find_cache_file(results_dir, key, legacy_key) is None:
             pending.append(f)
 
     if max_files > 0 and len(pending) > max_files:
