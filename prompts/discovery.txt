@@ -26,7 +26,13 @@ Format:
   "B1": [".java", ".m", ".py"],
   "B2": [".java", ".py", ".c"],
   "B3": [".java", ".py", ".m", ".sql", ".sh"],
-  ... (all B1 through B10)
+  "B4": [".java", ".py", ".js"],
+  "B5": [".yml", ".yaml", ".json", ".xml", ".properties"],
+  "B6": [".xml", ".gradle", ".json"],
+  "B7": [".java", ".py", ".m", ".js", ".properties"],
+  "B8": [".java", ".py", ".m", ".xml", ".c"],
+  "B9": [".java", ".py", ".m", ".c", ".properties", ".conf"],
+  "B10": [".java", ".py", ".m", ".js", ".ts", ".properties"]
 }}
 
 Only output valid JSON. No other text.

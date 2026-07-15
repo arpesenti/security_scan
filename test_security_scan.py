@@ -2788,5 +2788,128 @@ class TestVerifyCachePreCheck(unittest.TestCase):
         self.assertEqual(mock_pi.call_count, 0)
 
 
+# ── FINDING-26: Test --phase 2 --redetect warning ──────────────────────────
+
+
+class TestPhase2RedetectWarning(unittest.TestCase):
+    """FINDING-26: --phase 2 --redetect should emit a warning."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / ".security_scan"
+        (self.root / "code.py").write_text("x = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args, expect_exit=None, timeout=30):
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             *args],
+            cwd=str(self.root),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if expect_exit is not None:
+            self.assertEqual(
+                proc.returncode, expect_exit,
+                msg=f"Expected exit {expect_exit}, got {proc.returncode}\n"
+                    f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+        return proc
+
+    def test_phase2_redetect_emits_warning(self):
+        """When --phase 2 --redetect is used, a warning should be emitted."""
+        proc = self._run("--phase", "2", "--redetect", "--scanner", "B3")
+        combined = proc.stdout + proc.stderr
+        self.assertIn("--redetect ignored with --phase 2", combined)
+
+
+# ── FINDING-27: Test --concurrency 0 rejection ─────────────────────────────
+
+
+class TestConcurrencyZero(unittest.TestCase):
+    """FINDING-27: --concurrency 0 should be rejected with a clear error."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "code.py").write_text("x = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args, expect_exit=None, timeout=30):
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             *args],
+            cwd=str(self.root),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if expect_exit is not None:
+            self.assertEqual(
+                proc.returncode, expect_exit,
+                msg=f"Expected exit {expect_exit}, got {proc.returncode}\n"
+                    f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+        return proc
+
+    def test_concurrency_zero_rejected(self):
+        """--concurrency 0 should exit non-zero with a clear error message."""
+        proc = self._run("--scanner", "B3", "--concurrency", "0")
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("concurrency", combined.lower())
+
+
+# ── FINDING-28: Test large file graceful handling ───────────────────────────
+
+
+class TestLargeFileGraceful(unittest.TestCase):
+    """FINDING-28: Large file content (under 1 MiB but large) should be
+    handled gracefully — the JSON parser should not crash on truncated
+    model output."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.results = self.state / "test" / "results"
+        self.results.mkdir(parents=True)
+        self.sessions = self.state / "sessions"
+        self.sessions.mkdir()
+        self.cfg = {
+            "name": "test", "id": "B3", "label": "Test",
+            "prompt_file": "nope.txt", "base_ext": [".py"],
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_large_content_truncated_response_handled(self):
+        """A file with content exceeding a simulated small context should
+        produce a truncated response that the JSON parser handles without
+        crashing."""
+        # Create a file that is large but still under 1 MiB
+        filepath = self.root / "large.py"
+        filepath.write_text("x = 1\n" + "# line\n" * 50000)  # ~400 KB
+        # Mock pi returning a truncated JSON array (missing closing bracket)
+        truncated_response = '[{"line":1,"code":"x","severity":"High","explanation":"truncated output'
+        with patch.object(ss, "call_pi", return_value=("ok", truncated_response)):
+            result = ss.scan_file(
+                filepath, self.cfg, self.root, self.results, self.sessions,
+                "FILE: {filename}\n{file_content}",
+                prompt_hash_value="phash", timeout=60,
+            )
+        # The scan should not crash — the truncated-array recovery or
+        # error handling should produce a valid result
+        self.assertEqual(result["status"], "ok")
+        # The parsed result should be recoverable or have an error dict
+        parsed = result["result"]
+        self.assertIsInstance(parsed, (list, dict))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
