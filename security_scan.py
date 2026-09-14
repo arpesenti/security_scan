@@ -2834,10 +2834,11 @@ OWASP 2025 Categories:
     parser.add_argument(
         "--scan-tools",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Give phase 2 (scan) read-only tools (read,grep,find,ls). "
-             "Default: off (scan is high-recall single-file; tools add cost "
-             "and prompt-injection surface). Enable with --scan-tools.",
+        default=True,
+        help="Give phase 2 (scan) read-only tools (read,grep,find,ls) so the "
+             "scanner can inspect callers, sanitizers, and auth middleware in "
+             "related files. Default: on. Disable with --no-scan-tools for "
+             "the cheaper single-file scan.",
     )
     parser.add_argument(
         "--verify-tools",
@@ -2929,10 +2930,10 @@ OWASP 2025 Categories:
                       "tsv": "security_report.tsv"}[args.report_format]
     raw_output_path = Path(args.output) if args.output else repo_root / default_output
     output_path = output_path_for_format(raw_output_path, args.report_format)
-    # Per-phase tools config. The default per the user is: discovery on,
-    # scan off, verify on. Each flag has a BooleanOptionalAction so the
-    # user can flip any of them with --no-<phase>-tools. The tools list
-    # (read-only) is fixed; only the per-phase on/off is user-configurable.
+    # Per-phase tools config. The default is: discovery on, scan on,
+    # verify on. Each flag has a BooleanOptionalAction so the user can flip
+    # any of them with --no-<phase>-tools. The tools list (read-only) is
+    # fixed; only the per-phase on/off is user-configurable.
     phase_tools = {
         "discovery": bool(args.discovery_tools),
         "scan": bool(args.scan_tools),

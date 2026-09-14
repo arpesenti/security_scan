@@ -25,6 +25,8 @@ to rate each finding's confidence and exploitability in the context of the file 
   phases
 - **In-place progress line** with per-phase count + rate + ETA, on stderr, TTY-aware
   (`--no-progress` to silence)
+- **Tools-on scan by default** (`--no-scan-tools` to opt out): phase 2 runs with read-only
+  tools so the scanner can inspect callers, sanitizers, and auth middleware in related files
 - Concurrent scans (`--concurrency`)
 - Dry-run mode (`--dry-run`) for previewing which files would be scanned
 - Override the per-scanner extension list (`--formats`)
@@ -57,8 +59,13 @@ There are no Python dependencies to install.
 ## Quick start
 
 ```bash
-# Run all 10 scanners end-to-end (discovery + scan + report)
+# Run all 10 scanners end-to-end (discovery + scan + report).
+# Scan and verify run with read-only tools by default, so the scanner can
+# inspect callers, sanitizers, and auth middleware in related files.
 ./security_scan.py --all
+
+# Opt out of tools for scan (cheaper single-file scan; separate cache layout)
+./security_scan.py --all --no-scan-tools
 
 # Run a single scanner
 ./security_scan.py --scanner B3
@@ -75,8 +82,8 @@ There are no Python dependencies to install.
 # Disable tools for verify (use the original file-as-written verifier)
 ./security_scan.py --all --verify --no-verify-tools
 
-# Enable tools for scan too (slower, more powerful, opt-in)
-./security_scan.py --all --scan-tools --no-verify-tools
+# Opt out of tools for scan too (fastest, single-file analysis)
+./security_scan.py --all --no-scan-tools --no-verify-tools
 
 # Preview which files WOULD be scanned, without calling the model
 ./security_scan.py --all --dry-run
@@ -195,7 +202,7 @@ cannot execute, edit, write, or fetch.
 | Phase | Default | CLI flag | Why / why not |
 |-------|---------|----------|----------------|
 | Discovery | **on** | `--discovery-tools` / `--no-discovery-tools` | Tools let the model read `package.json`, browse the tree, and check framework-specific files before deciding which extensions matter per OWASP category. Cheap (one call per run) and the input is the repo structure, not untrusted code. |
-| Scan | **off** | `--scan-tools` / `--no-scan-tools` | Scan is high-recall single-file pattern matching. Tools add cost (5-10× per file) and a prompt-injection surface on every file read. Off by default; opt in for high-stakes scans. |
+| Scan | **on** | `--scan-tools` / `--no-scan-tools` | The scanner can inspect callers, sanitizers, and auth middleware in related files instead of judging each file in isolation — this attacks the false-positive root cause at scan time. Costs ~2–3× per file. Opt out with `--no-scan-tools` for the cheaper high-recall single-file scan. |
 | Verify | **on** | `--verify-tools` / `--no-verify-tools` | The whole reason verify exists is to do cross-file judgment — is this input sanitized upstream, is this function only called from tests, does the auth middleware already cover this route. With tools, the model can actually look. Off disables for the original file-as-written verifier. |
 
 ## Per-phase reasoning control
@@ -223,7 +230,8 @@ the other mode's cache:
 | Verify | `.security_scan/<scanner>/verifications/` | `.security_scan/<scanner>/verifications-tools/` |
 
 The markdown report's header shows the resolved mode for each phase (e.g.
-`Tools: discovery=read-only · scan=none · verify=read-only`), and each
+`Tools: discovery=read-only · scan=read-only · verify=read-only` under the
+new default, or `scan=none` after `--no-scan-tools`), and each
 per-scanner section gets a `Verify tools` row when verify is in tools mode.
 
 **Trade-off**: tools mode is slower (multiple round-trips per call), more
@@ -290,7 +298,7 @@ each is independently grep-able.
 | `--fail-on-confidence LEVEL` | `never` | Exit non-zero if any finding whose verifier confidence is at or above `LEVEL` is present (one of `low`, `medium`, `high`). Unverified findings are treated as below any threshold. |
 | `--report-format FMT` | `md` | Output format: `md` (human-readable markdown, default), `csv` or `tsv` (one row per finding, for spreadsheet import). The file extension on `--output` is auto-adjusted to match. |
 | `--discovery-tools` / `--no-discovery-tools` | on | Give phase 1 (discovery) read-only tools (`read`,`grep`,`find`,`ls`). The model can browse the repo before deciding which extensions matter. |
-| `--scan-tools` / `--no-scan-tools` | off | Give phase 2 (scan) read-only tools. Off by default — scan is high-recall single-file; tools add cost and prompt-injection surface. |
+| `--scan-tools` / `--no-scan-tools` | on | Give phase 2 (scan) read-only tools. On by default — the scanner can inspect callers, sanitizers, and auth middleware in related files. `--no-scan-tools` for the cheaper single-file scan. |
 | `--verify-tools` / `--no-verify-tools` | on | Give phase 3 (verify) read-only tools. The model can read related files (callers, sanitizers, auth middleware) before rating each finding's confidence. |
 | `--scan-thinking LEVEL` | `off` | Reasoning effort for the scan phase: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. Scan is high-recall pattern enumeration; the model already has the whole file inline, so chain-of-thought adds latency without recall benefit. Cache key includes this value. |
 | `--verify-thinking LEVEL` | `medium` | Reasoning effort for the verify phase. Per-finding judgment benefits from chain-of-thought. Cache key includes this value. |

@@ -2911,5 +2911,160 @@ class TestLargeFileGraceful(unittest.TestCase):
         self.assertIsInstance(parsed, (list, dict))
 
 
+# ── Ticket 01: Tools-on scan by default ─────────────────────────────────────
+
+
+class TestScanToolsDefaultCLI(unittest.TestCase):
+    """Ticket 01: scan runs with read-only tools by default; --no-scan-tools
+    opts out. Tools-mode and no-tools-mode results live in separate cache
+    layouts, and per-file caching works unchanged in both modes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / ".security_scan"
+        (self.root / "code.py").write_text("x = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args, expect_exit=None, timeout=30):
+        # A fake `pi` on PATH: exit 0, stdout "[]" (no findings), and appends
+        # a line to pi_calls.log so tests can assert whether the model was
+        # actually invoked (the scanner runs in a subprocess, so in-process
+        # mocks don't reach it).
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        fake_pi = bin_dir / "pi"
+        if not fake_pi.exists():
+            fake_pi.write_text(
+                '#!/bin/sh\necho "[]"\necho called >> '
+                + json.dumps(str(self.root / "pi_calls.log")) + '\n'
+            )
+            fake_pi.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             *args],
+            cwd=str(self.root),
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        if expect_exit is not None:
+            self.assertEqual(
+                proc.returncode, expect_exit,
+                msg=f"Expected exit {expect_exit}, got {proc.returncode}\n"
+                    f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+        return proc
+
+    def _pi_call_count(self):
+        log = self.root / "pi_calls.log"
+        if not log.exists():
+            return 0
+        return len(log.read_text().splitlines())
+
+    def _seed_discovery(self, variant="discovery-tools.json"):
+        # The default scan-tools mode caches discovery in discovery-tools.json
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / variant).write_text(
+            json.dumps({"B3": [".py"]})
+        )
+
+    def _seed_scan_cache(self, results_variant):
+        """Seed a valid cached scan result using the live prompt hash so the
+        scanner treats the file as already scanned."""
+        results_dir = self.state / "injection" / results_variant
+        results_dir.mkdir(parents=True, exist_ok=True)
+        c_hash = ss.content_hash((self.root / "code.py").read_bytes())
+        p_hash = ss.prompt_hash(ss.load_prompt_template(ss.OWASP_SCANNERS["B3"]))
+        key = ss.file_key("code.py", "injection", c_hash, p_hash, "off")
+        (results_dir / f"{key}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "injection", "status": "ok",
+            "result": [], "content_hash": c_hash, "prompt_hash": p_hash,
+        }))
+
+    def test_default_scan_uses_tools_results_layout(self):
+        """Running with no flag overrides routes phase 2 to results-tools/"""
+        self._seed_discovery()
+        self._run("--scanner", "B3", "--phase", "2", expect_exit=0)
+        self.assertGreater(self._pi_call_count(), 0, "scan must call the model")
+        self.assertTrue(
+            (self.state / "injection" / "results-tools").exists(),
+            "default scan must write to results-tools/",
+        )
+        self.assertFalse(
+            (self.state / "injection" / "results").exists(),
+            "default scan must not touch the no-tools results/ dir",
+        )
+
+    def test_opt_out_flag_uses_no_tools_layout(self):
+        """--no-scan-tools routes phase 2 back to the plain results/ dir."""
+        self._seed_discovery()  # discovery default is tools mode
+        self._run("--scanner", "B3", "--phase", "2", "--no-scan-tools",
+                  expect_exit=0)
+        self.assertGreater(self._pi_call_count(), 0, "scan must call the model")
+        self.assertTrue((self.state / "injection" / "results").exists())
+        self.assertFalse(
+            (self.state / "injection" / "results-tools").exists(),
+            "opted-out scan must not touch results-tools/",
+        )
+
+    def test_cached_scan_results_reused_second_run_tools_mode(self):
+        """Second run in the default mode reuses the cached result without
+        calling the model again."""
+        self._seed_discovery()
+        self._seed_scan_cache("results-tools")
+        self._run("--scanner", "B3", "--phase", "2", expect_exit=0)
+        self.assertEqual(self._pi_call_count(), 0)
+
+    def test_cached_scan_results_reused_second_run_no_tools_mode(self):
+        self._seed_discovery()  # discovery default is tools mode
+        self._seed_scan_cache("results")
+        self._run("--scanner", "B3", "--phase", "2", "--no-scan-tools",
+                  expect_exit=0)
+        self.assertEqual(self._pi_call_count(), 0)
+
+    def test_report_scan_tools_line_reflects_default_mode(self):
+        """The report's Tools line shows scan=read-only in the default mode."""
+        results_dir = self.state / "injection" / "results-tools"
+        results_dir.mkdir(parents=True)
+        (results_dir / "a_py.json").write_text(json.dumps({
+            "file": "a.py", "scanner": "injection", "status": "ok",
+            "result": [{"line": 1, "severity": "High", "code": "x",
+                        "explanation": "", "fix": ""}],
+            "content_hash": "abc",
+        }))
+        ss.build_report(
+            self.state, self.root / "report.md", self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            phase_tools={"discovery": True, "scan": True, "verify": True},
+        )
+        text = (self.root / "report.md").read_text()
+        self.assertIn("scan=read-only", text)
+
+    def test_report_scan_tools_line_reflects_opt_out(self):
+        results_dir = self.state / "injection" / "results"
+        results_dir.mkdir(parents=True)
+        (results_dir / "a_py.json").write_text(json.dumps({
+            "file": "a.py", "scanner": "injection", "status": "ok",
+            "result": [{"line": 1, "severity": "High", "code": "x",
+                        "explanation": "", "fix": ""}],
+            "content_hash": "abc",
+        }))
+        ss.build_report(
+            self.state, self.root / "report.md", self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            phase_tools={"discovery": True, "scan": False, "verify": True},
+        )
+        text = (self.root / "report.md").read_text()
+        self.assertIn("scan=none", text)
+
+    def test_help_lists_scan_tools_opt_out(self):
+        proc = self._run("--help")
+        self.assertIn("--no-scan-tools", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
