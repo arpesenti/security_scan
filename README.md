@@ -136,28 +136,41 @@ as one JSON file per (scanner, file) under `.security_scan/<scanner>/results/`.
 - On any error or timeout, the failure is cached as `{"status": "error" | "timeout", "result": ...}`
   so a later report can show the breakdown.
 
-### Phase 3 — Verification (optional)
+### Phase 3 — Verification (optional, refutation-first)
 
 When `--verify` is set, every file that produced at least one finding in phase 2 is sent to
-`pi` again with a single shared prompt template (`prompts/verify_prompt.txt`). The model is
-asked to look at the file as a whole and rate each finding's **confidence** (`High` / `Medium` /
-`Low`) and **exploitability** (`yes` / `no` / `conditional`), plus a one-line justification.
-The verifier is essentially a sanity check on the phase-2 scanner's output — the kinds of
-issues that trip a false positive are listed in the prompt: dead code, sanitization upstream
-in the same file, defense-in-depth wrappers, hardcoded constants mistaken for user input,
-functions only called from tests, etc.
+`pi` again with a single shared prompt template (`prompts/verify_prompt.txt`). The prompt is
+**refutation-first**: the verifier is told to assume every finding is wrong and to hunt —
+using its read-only tools — for the sanitizer, parameterization, allowlist, dead path, or
+test-only caller that proves each finding safe. Findings it fails to refute are
+**confirmed**; the rest are **Refuted Findings**.
+
+Each verdict keeps the `confidence` (`High` / `Medium` / `Low`) and `exploitability`
+(`yes` / `no` / `conditional`) axes, adds a `verdict` (`confirmed` / `refuted`), and requires
+cited evidence in the `verification_reason` for every refutation (which sanitizer, which
+parameterization site, which dead branch, which test-only caller). Findings tagged
+`unsubstantiated` (see [phase 2](#phase-2--scan)) get extra scrutiny — the verifier
+reconstructs the taint path itself; they are never skipped.
 
 The verdict is overlaid onto the report:
 
 - Each finding shows a `Verification: ✅ High confidence, exploitable: yes — …` line under its
   existing `Why` / `Fix` block.
+- **Refuted Findings** leave Vulnerable Files, the Risk Heatmap, and the CI gate; they appear
+  in a skim-only **Refuted** section showing each refutation's cited evidence — read as
+  reasons, not code.
+- Not-actionable findings (confirmed but `exploitable: no` / `conditional` — dead code,
+  test-only callers, defense-in-depth) are re-bucketed below the line without being
+  suppressed; they resurrect if the code path wakes up (content-hash cache invalidation
+  handles that naturally).
 - The **Vulnerable Files** table grows a per-confidence breakdown (High / Medium / Low /
   Unverified).
-- The **Global Summary** gains a verification-coverage row.
-- The **Risk Heatmap** and **Overall Risk** line switch to *gated* counts (only findings at
-  or above the `--fail-on-confidence` level) when a threshold is set.
-- A new **Needs Review** section lists every finding below the gate with its verifier's
-  reason, so a human can triage it (and promote confirmed false positives to the allowlist).
+- The **Global Summary** gains verification-coverage and per-bucket rows.
+- The **Risk Heatmap** and **Overall Risk** line reflect confirmed findings (and only those
+  at or above the `--fail-on-confidence` level when a threshold is set).
+- A **Needs Review** section lists every finding below the confidence gate with its
+  verifier's reason, so a human can triage it (and promote confirmed false positives to the
+  allowlist).
 
 Results are cached as one JSON file per (scanner, file) under
 `.security_scan/<scanner>/verifications/`, keyed on the file's content hash, the findings

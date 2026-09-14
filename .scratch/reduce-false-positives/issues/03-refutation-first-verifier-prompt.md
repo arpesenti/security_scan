@@ -4,10 +4,14 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] New verify prompt frames refutation as the primary job; evidence citations required in the refutation reason
-- [ ] Running verify with `--reverify` against a file with known false positives produces refutation-style verdicts with cited evidence
-- [ ] Verdict schema remains compatible with existing confidence/exploitability report rendering
-- [ ] Findings payload with an `unsubstantiated` tag is handled (extra scrutiny); payload without it also handled
-- [ ] README's phase-3 section describes the refutation-first behavior
+- [x] New verify prompt frames refutation as the primary job; evidence citations required in the refutation reason
+- [x] Running verify with `--reverify` against a file with known false positives produces refutation-style verdicts with cited evidence
+- [x] Verdict schema remains compatible with existing confidence/exploitability report rendering
+- [x] Findings payload with an `unsubstantiated` tag is handled (extra scrutiny); payload without it also handled
+- [x] README's phase-3 section describes the refutation-first behavior
+
+## Comments
+
+- Rewrote `prompts/verify_prompt.txt` and `DEFAULT_VERIFY_PROMPT`: refuter framing ("assume every finding is wrong; hunt for the sanitizer / parameterization / allowlist / dead path / test-only caller"), `verdict: confirmed|refuted` added alongside the existing confidence/exploitability axes, cited evidence required in `verification_reason` for refutations. Verdict semantics per ADR: refuted = misread (pattern actually safe); dead code / test-only / defense-in-depth = confirmed but unreachable (`exploitable: no|conditional`) → not-actionable in ticket 04. `verify_finding` now records the `verdict` field in the verifications map. Prompt hash change auto-invalidates cached verdicts (existing cache-key machinery). Tests: `TestRefutationFirstVerifyPrompt`.

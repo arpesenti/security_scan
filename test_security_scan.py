@@ -3304,5 +3304,126 @@ class TestPromptHashInvalidatesScanCache(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+# ── Ticket 03: Refutation-first verifier prompt ─────────────────────────────
+
+
+class TestRefutationFirstVerifyPrompt(unittest.TestCase):
+    """Ticket 03: the verify prompt reframes verification as refutation:
+    assume every finding is wrong and hunt for the evidence that proves it
+    safe; verdicts keep the confidence/exploitability axes and gain cited
+    evidence in the reason."""
+
+    def test_prompt_frames_refutation_as_primary_job(self):
+        text = ss.load_verify_prompt()
+        flat = " ".join(text.lower().split())
+        # The core reframing: assume wrong + hunt for refutation evidence
+        self.assertIn("assume every finding is wrong", flat)
+        self.assertIn("refute", flat)
+
+    def test_prompt_lists_refutation_targets(self):
+        text = ss.load_verify_prompt()
+        for target in ("sanitizer", "parameteriz", "allowlist",
+                       "dead", "test-only"):
+            self.assertIn(target, text.lower(),
+                          f"refutation target {target!r} missing from prompt")
+
+    def test_prompt_requires_evidence_citation_in_reason(self):
+        text = ss.load_verify_prompt()
+        # Refuted verdicts must cite the specific evidence
+        self.assertIn("cite", text.lower())
+
+    def test_prompt_keeps_confidence_and_exploitable_axes(self):
+        text = ss.load_verify_prompt()
+        self.assertIn('"confidence"', text)
+        self.assertIn('"exploitable"', text)
+        self.assertIn('"verification_reason"', text)
+
+    def test_prompt_handles_unsubstantiated_tag(self):
+        text = ss.load_verify_prompt()
+        self.assertIn("unsubstantiated", text)
+
+    def test_builtin_fallback_matches_refutation_framing(self):
+        # Both the file and the built-in default must carry the framing;
+        # if the file is missing the fallback still refutes.
+        path = ss.PROMPTS_DIR / ss.VERIFY_PROMPT_FILE
+        backup = path.read_text()
+        try:
+            path.unlink()
+            text = ss.load_verify_prompt()
+            flat = " ".join(text.lower().split())
+            self.assertIn("assume every finding is wrong", flat)
+            self.assertIn("refute", flat)
+            self.assertIn('"verification_reason"', text)
+        finally:
+            path.write_text(backup)
+
+    def test_prompt_hash_change_invalidates_verify_cache(self):
+        # Rewriting the verify prompt must trigger the one-time full
+        # re-verification of cached verdicts (via the cache key).
+        h1 = ss.prompt_hash("old prompt")
+        h2 = ss.prompt_hash("new refutation-first prompt")
+        self.assertNotEqual(h1, h2)
+        a = ss.verify_file_key("a.py", "injection", "ch", "fsig", h1)
+        b = ss.verify_file_key("a.py", "injection", "ch", "fsig", h2)
+        self.assertNotEqual(a, b)
+
+    def test_verify_finding_records_verdict_field(self):
+        """The refutation verdict is captured alongside the existing axes."""
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        verify_dir = root / "verifications"
+        verify_dir.mkdir()
+        sessions = root / "sessions"
+        sessions.mkdir()
+        f = root / "code.py"
+        f.write_text("x = 1\n")
+        findings = [{"line": 1, "code": "q", "severity": "High",
+                     "explanation": "", "fix": ""}]
+        raw = json.dumps([{
+            "line": 1, "verdict": "refuted", "confidence": "High",
+            "exploitable": "no",
+            "verification_reason": "refuted: parameterized by QueryBuilder (db/qb.py:42)",
+        }])
+        with patch.object(ss, "call_pi", return_value=("ok", raw)):
+            result = ss.verify_finding(
+                f, ss.OWASP_SCANNERS["B3"], "code.py", findings, root,
+                verify_dir, sessions,
+                "FINDINGS: {findings_json}\nFILE: {filename}\n{file_content}",
+                "vphash", timeout=60,
+            )
+        vfd = result["verifications"]["1"]
+        self.assertEqual(vfd["verdict"], "refuted")
+        self.assertEqual(vfd["confidence"], "High")
+        self.assertEqual(vfd["exploitable"], "no")
+        self.assertIn("parameterized", vfd["verification_reason"])
+        tmp.cleanup()
+
+    def test_verify_finding_payload_without_tags_still_works(self):
+        """Findings payload without the unsubstantiated tag is handled fine."""
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        verify_dir = root / "verifications"
+        verify_dir.mkdir()
+        sessions = root / "sessions"
+        sessions.mkdir()
+        f = root / "code.py"
+        f.write_text("x = 1\n")
+        findings = [{"line": 1, "code": "q", "severity": "High",
+                     "explanation": "", "fix": ""}]
+        raw = json.dumps([{
+            "line": 1, "verdict": "confirmed", "confidence": "Medium",
+            "exploitable": "yes", "verification_reason": "taint path holds",
+        }])
+        with patch.object(ss, "call_pi", return_value=("ok", raw)):
+            result = ss.verify_finding(
+                f, ss.OWASP_SCANNERS["B3"], "code.py", findings, root,
+                verify_dir, sessions,
+                "FINDINGS: {findings_json}\nFILE: {filename}\n{file_content}",
+                "vphash", timeout=60,
+            )
+        self.assertEqual(result["verifications"]["1"]["verdict"], "confirmed")
+        tmp.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
