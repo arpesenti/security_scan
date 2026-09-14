@@ -137,8 +137,9 @@ as one JSON file per (scanner, file) under `.security_scan/<scanner>/results/`.
 - Concurrency is bounded by `--concurrency` (default `4`).
 - Per-file pi call timeout is `--scan-timeout` (default `180s`); discovery uses
   `--discovery-timeout` (default `240s`).
-- On any error or timeout, the failure is cached as `{"status": "error" | "timeout", "result": ...}`
-  so a later report can show the breakdown.
+- On any error or timeout, the failure is NOT cached — the failed entry is removed so the
+  next run retries the file automatically (a transient pi failure never blocks a file
+  forever). The report still shows the error/timeouts count for the affected files.
 
 ### Phase 3 — Verification (optional, refutation-first)
 
@@ -173,7 +174,7 @@ The verdict is overlaid onto the report:
 - The **Risk Heatmap** and **Overall Risk** line reflect confirmed findings (and only those
   at or above the `--fail-on-confidence` level when a threshold is set).
 - A **Needs Review** section lists every finding below the confidence gate with its
-  verifier's reason, so a human can triage it (and promote confirmed false positives to the
+  verifier's reason, so a human can triage it (and promote confirmed misreads to the
   allowlist).
 
 Results are cached as one JSON file per (scanner, file) under
@@ -205,9 +206,8 @@ directory) and the model sees it for every scan and verify call.
   variable interpolation.
 ```
 
-Disable with `--no-context-files` (passes the flag through to pi) if a
-project's `AGENTS.md` would mislead the scanner. The flag is per-call and
-doesn't affect `pi`'s own settings.
+If a project's `AGENTS.md` would mislead the scanner, fix or move the file —
+the scanner has no flag to disable pi's auto-loading.
 
 ## Per-phase tool support
 
@@ -379,7 +379,7 @@ reason to skip verification.
 The verify prompt expects an array (one entry per input finding) in this shape:
 
 ```json
-[{"line": 123, "confidence": "High", "exploitable": "yes", "verification_reason": "..."}]
+[{"line": 123, "verdict": "confirmed", "confidence": "High", "exploitable": "yes", "verification_reason": "..."}]
 ```
 
 To change a scanner's wording:
@@ -529,9 +529,12 @@ both formats, run twice with different `--output` paths.
 ## Exit codes (for CI)
 
 ```text
-exit 0  Clean run (no findings at or above --fail-on or --fail-on-confidence threshold, no scan errors)
-exit 1  At least one finding trips --fail-on or --fail-on-confidence
-exit 2  Scan completed but at least one file errored/timed out (no signal from it)
+exit 0  Clean run (no confirmed findings at or above the confidence gate,
+        nothing trips --fail-on, and no scan errors)
+exit 1  --fail-on tripped, or at least one file errored/timed out during scan
+        (inconclusive — no signal from the failed files)
+exit 3  --fail-on-confidence tripped (gated counts: only confirmed findings
+        count; refuted and not-actionable findings never trip this gate)
 ```
 
 Default is `--fail-on never` (always exit 0). For raw severity gating:
@@ -540,19 +543,21 @@ Default is `--fail-on never` (always exit 0). For raw severity gating:
 ./security_scan.py --scanner B1,B3,B7 --fail-on high
 ```
 
-For confidence-gated gating (only count findings the verifier trusts):
+For confidence-gated gating (only count confirmed findings the refuter could
+not kill):
 
 ```bash
 ./security_scan.py --scanner B1,B3,B7 --verify --fail-on-confidence high
 ```
 
-`--fail-on` and `--fail-on-confidence` are independent — both can be set in the same run,
-and either gate that trips exits 1. Unverified findings are treated as below any
-`--fail-on-confidence` threshold, so running `--fail-on-confidence` without `--verify` is a
-no-op for the gate (no finding will have a confidence to compare).
+`--fail-on` and `--fail-on-confidence` are independent — both can be set in the same run.
+`--fail-on` and scan errors exit 1; a tripped confidence gate exits 3 (so CI scripts can
+distinguish "raw finding found" from "confirmed finding found"). Unverified findings are
+treated as below any `--fail-on-confidence` threshold, so running `--fail-on-confidence`
+without `--verify` is a no-op for the gate (no finding will have a confidence to compare).
 
-Inconclusive runs (exit 2) are distinct from clean runs (exit 0) so a flaky pipeline can't
-silently pass. Combine the two flags in CI scripts:
+Inconclusive runs (exit 1 on scan errors) are distinct from clean runs (exit 0) so a flaky
+pipeline can't silently pass. Combine the two flags in CI scripts:
 
 ```bash
 ./security_scan.py --all --verify --fail-on high --fail-on-confidence high \
@@ -594,7 +599,7 @@ top of `security_scan.py`.
   error rows and the global error/timeouts count.
 - **A scan file disappears from the report** — corrupt cache JSON. The scanner logs a warning
   and skips the bad file rather than aborting the report.
-- **CI is failing with exit 2** — at least one file errored during scanning. Look at the
+- **CI is failing with exit 1 on scan errors** — at least one file errored during scanning. Look at the
   per-file cache JSONs (`status: "error"` or `status: "timeout"`). It is *not* a finding, so
   the allowlist will not help; fix the underlying scan failure (usually a pi timeout —
   raise `--scan-timeout`).

@@ -1892,9 +1892,10 @@ def verdict_bucket(vfd: dict | None) -> str:
     - verdict == "refuted"               → "refuted"
     - verdict == "confirmed"             → exploitable "yes" → "confirmed";
                                            "no"/"conditional" → "not_actionable"
-    - legacy record without a "verdict"  → derived: exploitable "no" or
-                                           confidence "Low" → "refuted";
-                                           exploitable "conditional" →
+    - legacy record without a "verdict"  → derived: confidence "Low" →
+                                           "refuted" (the old Low meant
+                                           "likely false positive");
+                                           exploitable "no"/"conditional" →
                                            "not_actionable"; else "confirmed"
     """
     if not vfd:
@@ -1909,9 +1910,14 @@ def verdict_bucket(vfd: dict | None) -> str:
             return "confirmed"
         return "not_actionable"
     # Legacy verdicts (pre-refutation-first caches) carry no verdict field.
-    if exploitable == "no" or confidence == "Low":
+    # Derive as faithfully as the old axes allow: confidence "Low" meant
+    # "likely false positive" (a misread) → refuted; the ADR maps
+    # exploitable "no"/"conditional" to real-but-unreachable → not_actionable
+    # (ticket 04's rule), which is the safer legacy reading — these findings
+    # stay below the line and resurrect if the path wakes up.
+    if confidence == "Low":
         return "refuted"
-    if exploitable == "conditional":
+    if exploitable in ("no", "conditional"):
         return "not_actionable"
     return "confirmed"
 
@@ -2250,8 +2256,6 @@ def build_report(
                     })
                     suppressed_scanner += 1
                 else:
-                    if UNSUBSTANTIATED_TAG in (v.get("tags") or []):
-                        unsubstantiated_scanner += 1
                     active.append(v)
 
             # Overlay phase-3 verification: look up a per-(scanner, file)
@@ -2286,6 +2290,13 @@ def build_report(
                 v["_verification_reason"] = vfd.get("verification_reason", "") if vfd else ""
                 v["_verdict"] = vfd.get("verdict", "") if vfd else ""
                 v["_bucket"] = bucket
+
+                # Unsubstantiated counts only findings that are still live:
+                # a refuted finding's missing source is moot, and counting it
+                # in both rows would double-count it in the per-scanner
+                # summary (review finding from the code-review pass).
+                if bucket != "refuted" and UNSUBSTANTIATED_TAG in (v.get("tags") or []):
+                    unsubstantiated_scanner += 1
 
                 if bucket == "refuted":
                     refuted_findings_global.append({
@@ -2687,7 +2698,7 @@ def build_report(
         else:
             w("The following findings are below `High` confidence. They are still "
               "counted in the severity totals above, but are surfaced here so a "
-              "human can triage them. Promote confirmed false positives to the "
+              "human can triage them. Promote confirmed misreads to the "
               "allowlist, or run with `--fail-on-confidence` to gate CI on High-"
               "confidence findings only.")
         w()
@@ -3020,9 +3031,6 @@ def build_csv_report(
                     suppressed_count += 1
                     continue
 
-                if UNSUBSTANTIATED_TAG in (v.get("tags") or []):
-                    unsubstantiated_count += 1
-
                 # Refutation-first bucketing, mirroring build_report: refuted
                 # and not-actionable rows keep their verification data but
                 # leave the severity counts, the gated counts, and the CI gate.
@@ -3034,6 +3042,11 @@ def build_csv_report(
                                  "suppression_reason": ""})
                     refuted_count += 1
                     continue
+                # Unsubstantiated counts only live findings — a refuted
+                # finding's missing source is moot (no double-counting in
+                # the summary).
+                if UNSUBSTANTIATED_TAG in (v.get("tags") or []):
+                    unsubstantiated_count += 1
                 if bucket == "not_actionable":
                     rows.append({**base_row,
                                  "status": "not_actionable",

@@ -3670,6 +3670,24 @@ class TestRefutationBuckets(unittest.TestCase):
         self.assertIn("| Not-Actionable | 2 |", text)
         self.assertIn("| Unsubstantiated (no named source) | 1 |", text)
 
+    def test_unsubstantiated_refuted_finding_not_double_counted(self):
+        """Review finding: a refuted finding that also carries the
+        unsubstantiated tag appears in the Refuted row, not in the
+        Unsubstantiated row — the summary rows are peers, not overlapping."""
+        self._seed("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": "", "tags": ["unsubstantiated"]},
+        ], {
+            "1": {"verdict": "refuted", "confidence": "High",
+                  "exploitable": "no", "verification_reason": "refuted: safe"},
+        })
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertEqual(stats["refuted_count"], 1)
+        self.assertEqual(stats["unsubstantiated_count"], 0)
+
     def test_suppressed_findings_work_alongside_new_buckets(self):
         vulns = self._vulns()[:2]
         self._seed("a.py", vulns, {
@@ -3707,6 +3725,23 @@ class TestRefutationBuckets(unittest.TestCase):
         self.assertEqual(stats["confirmed_count"], 1)
         self.assertEqual(stats["refuted_count"], 1)
         self.assertEqual(stats["not_actionable_count"], 1)
+
+    def test_legacy_high_confidence_exploitable_no_is_not_actionable(self):
+        """Review finding P1: a legacy verdict with High confidence and
+        exploitable "no" describes a real-but-unreachable finding — the same
+        shape the new semantics bucket as not-actionable. Only legacy Low
+        confidence ("likely false positive") maps to refuted."""
+        self._seed("a.py", self._vulns()[:1], {
+            "1": {"confidence": "High", "exploitable": "no",
+                  "verification_reason": "function has no callers"},
+        })
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertEqual(stats["not_actionable_count"], 1)
+        self.assertEqual(stats["refuted_count"], 0)
+        self.assertEqual(stats["confirmed_count"], 0)
 
     def test_no_verification_keeps_legacy_behavior(self):
         self._seed("a.py", self._vulns()[:2])  # no verification at all
