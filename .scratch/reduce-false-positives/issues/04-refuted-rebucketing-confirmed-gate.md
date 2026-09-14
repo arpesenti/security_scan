@@ -4,11 +4,15 @@
 
 **Blocked by:** 03 (refutation-first verifier prompt — the new verdict semantics must exist first).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Refuted findings appear only in the Refuted section, with their evidence; absent from Vulnerable Files, heatmap, and overall risk counts
-- [ ] Not-actionable findings (exploitable: no/conditional) are re-bucketed below the line, not suppressed, and never written to the allowlist
-- [ ] `--fail-on-confidence` gate counts only confirmed findings; CI exit codes reflect this
-- [ ] Per-scanner summary shows confirmed / refuted / unsubstantiated / suppressed counts
-- [ ] Suppressed (allowlisted) findings continue to work unchanged alongside the new buckets
-- [ ] Tests cover bucket placement for each verdict combination
+- [x] Refuted findings appear only in the Refuted section, with their evidence; absent from Vulnerable Files, heatmap, and overall risk counts
+- [x] Not-actionable findings (exploitable: no/conditional) are re-bucketed below the line, not suppressed, and never written to the allowlist
+- [x] `--fail-on-confidence` gate counts only confirmed findings; CI exit codes reflect this
+- [x] Per-scanner summary shows confirmed / refuted / unsubstantiated / suppressed counts
+- [x] Suppressed (allowlisted) findings continue to work unchanged alongside the new buckets
+- [x] Tests cover bucket placement for each verdict combination
+
+## Comments
+
+- `verdict_bucket()` maps each verification record to a bucket: explicit `verdict: refuted` → Refuted section (with cited evidence); confirmed + `exploitable: no|conditional` → Not-Actionable (below the line, never suppressed/allowlisted); confirmed + `yes` → active; no verdict → unverified (legacy raw counting). Legacy cached verdicts without a `verdict` field derive the bucket from exploitable/confidence. `--fail-on-confidence` (exit 3) counts only gated = confirmed-at/above-cutoff findings. Per-scanner + global summaries gained Confirmed/Refuted/Not-Actionable/Unsubstantiated rows; CSV gained `refuted`/`not_actionable` statuses plus source/sink/tags/verdict columns. Tests: `TestRefutationBuckets`, updated `TestBuildReportWithVerification`, `test_csv_refuted_and_not_actionable_statuses`.

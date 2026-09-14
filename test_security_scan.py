@@ -1168,18 +1168,21 @@ class TestBuildReportWithVerification(unittest.TestCase):
         ]
         c_hash = self._write_scan_result("a.py", vulns)
         self._write_verification("a.py", c_hash, vulns, {
-            "1": {"confidence": "High", "exploitable": "yes",
+            "1": {"verdict": "confirmed", "confidence": "High", "exploitable": "yes",
                    "verification_reason": "reachable from main"},
-            "2": {"confidence": "Low", "exploitable": "no",
+            "2": {"verdict": "refuted", "confidence": "Low", "exploitable": "no",
                    "verification_reason": "sanitized upstream"},
         })
         stats = ss.build_report(
             self.state, self.output, self.root, ["B3"],
             {"B3": [".py"]}, allowlist=[],
         )
+        # Finding 1 is confirmed and stays; finding 2 is refuted and leaves
+        # the counts entirely (it shows up in the Refuted section instead).
         self.assertEqual(stats["confidence_counts"]["High"], 1)
-        self.assertEqual(stats["confidence_counts"]["Low"], 1)
-        self.assertEqual(stats["verified_count"], 2)
+        self.assertEqual(stats["confidence_counts"]["Low"], 0)
+        self.assertEqual(stats["verified_count"], 1)
+        self.assertEqual(stats["refuted_count"], 1)
         self.assertEqual(stats["unverified_count"], 0)
         text = self.output.read_text()
         self.assertIn("High confidence", text)
@@ -1195,9 +1198,9 @@ class TestBuildReportWithVerification(unittest.TestCase):
         ]
         c_hash = self._write_scan_result("a.py", vulns)
         self._write_verification("a.py", c_hash, vulns, {
-            "1": {"confidence": "Low", "exploitable": "no",
+            "1": {"verdict": "confirmed", "confidence": "Low", "exploitable": "yes",
                    "verification_reason": "dead code"},
-            "2": {"confidence": "High", "exploitable": "yes",
+            "2": {"verdict": "confirmed", "confidence": "High", "exploitable": "yes",
                    "verification_reason": "reachable"},
         })
         stats = ss.build_report(
@@ -1205,7 +1208,7 @@ class TestBuildReportWithVerification(unittest.TestCase):
             {"B3": [".py"]}, allowlist=[],
             confidence_threshold="high",
         )
-        # Raw counts include both
+        # Raw counts include both confirmed findings
         self.assertEqual(stats["severity_counts"]["High"], 1)
         self.assertEqual(stats["severity_counts"]["Critical"], 1)
         # Gated counts: only the High-confidence Critical survives
@@ -1242,8 +1245,8 @@ class TestBuildReportWithVerification(unittest.TestCase):
         ]
         c_hash = self._write_scan_result("a.py", vulns)
         self._write_verification("a.py", c_hash, vulns, {
-            "1": {"confidence": "Low", "exploitable": "no",
-                   "verification_reason": "sanitized"},
+            "1": {"verdict": "confirmed", "confidence": "Medium",
+                  "exploitable": "yes", "verification_reason": "reachable"},
         })
         stats = ss.build_report(
             self.state, self.output, self.root, ["B3"],
@@ -1252,7 +1255,7 @@ class TestBuildReportWithVerification(unittest.TestCase):
         )
         # Without a threshold, gated counts are not computed
         self.assertIsNone(stats["severity_counts_gated"])
-        # Raw counts include the finding
+        # The confirmed finding counts in raw totals
         self.assertEqual(stats["severity_counts"]["High"], 1)
         # No needs-review without a threshold
         self.assertEqual(stats["needs_review_count"], 0)
@@ -1448,9 +1451,9 @@ class TestBuildCsvReport(unittest.TestCase):
         ]
         self._write_scan("a.py", vulns, c_hash="h1")
         self._write_verify("a.py", "h1", vulns, {
-            "1": {"confidence": "Low", "exploitable": "no",
+            "1": {"verdict": "confirmed", "confidence": "Low", "exploitable": "yes",
                    "verification_reason": "dead code"},
-            "2": {"confidence": "High", "exploitable": "yes",
+            "2": {"verdict": "confirmed", "confidence": "High", "exploitable": "yes",
                    "verification_reason": "reachable"},
         })
         stats = ss.build_csv_report(
@@ -1477,8 +1480,8 @@ class TestBuildCsvReport(unittest.TestCase):
         ]
         self._write_scan("a.py", vulns, c_hash="h1")
         self._write_verify("a.py", "h1", vulns, {
-            "1": {"confidence": "Low", "exploitable": "no",
-                   "verification_reason": ""},
+            "1": {"verdict": "confirmed", "confidence": "Medium",
+                   "exploitable": "yes", "verification_reason": ""},
         })
         stats = ss.build_csv_report(
             self.state, self.output, self.root, ["B3"],
@@ -1488,6 +1491,47 @@ class TestBuildCsvReport(unittest.TestCase):
         rows = self._read_csv(self.output)
         self.assertEqual(rows[0]["status"], "active")
         self.assertIsNone(stats["severity_counts_gated"])
+
+    def test_csv_refuted_and_not_actionable_statuses(self):
+        """Ticket 04: refuted and not-actionable verdicts get their own CSV
+        statuses and leave the severity counts and the gate."""
+        vulns = [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+            {"line": 2, "severity": "Critical", "code": "y",
+             "explanation": "", "fix": ""},
+            {"line": 3, "severity": "Medium", "code": "z",
+             "explanation": "", "fix": ""},
+        ]
+        self._write_scan("a.py", vulns, c_hash="h1")
+        self._write_verify("a.py", "h1", vulns, {
+            "1": {"verdict": "confirmed", "confidence": "High",
+                  "exploitable": "yes", "verification_reason": "r"},
+            "2": {"verdict": "refuted", "confidence": "High",
+                  "exploitable": "no", "verification_reason": "parameterized"},
+            "3": {"verdict": "confirmed", "confidence": "Medium",
+                  "exploitable": "no", "verification_reason": "dead code"},
+        })
+        stats = ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            confidence_threshold="high",
+        )
+        rows = self._read_csv(self.output)
+        statuses = {r["line"]: r["status"] for r in rows}
+        self.assertEqual(statuses["1"], "active")
+        self.assertEqual(statuses["2"], "refuted")
+        self.assertEqual(statuses["3"], "not_actionable")
+        # Refuted Critical and not-actionable Medium leave the counts
+        self.assertEqual(stats["severity_counts"]["Critical"], 0)
+        self.assertEqual(stats["severity_counts"]["Medium"], 0)
+        self.assertEqual(stats["severity_counts_gated"]["High"], 1)
+        self.assertEqual(stats["refuted_count"], 1)
+        self.assertEqual(stats["not_actionable_count"], 1)
+        # Refuted findings carry their evidence for candidate export
+        self.assertEqual(len(stats["refuted_findings"]), 1)
+        self.assertEqual(stats["refuted_findings"][0]["line"], 2)
+        self.assertIn("parameterized", stats["refuted_findings"][0]["reason"])
 
     def test_tsv_uses_tab_delimiter(self):
         self._write_scan("a.py", [
@@ -1582,7 +1626,9 @@ class TestReportFormatCLI(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.state = self.root / ".security_scan"
-        self.results_dir = self.state / "injection" / "results"
+        # Default mode runs scan with tools, so both the discovery cache and
+        # the seeded scan result must live in the tools-mode layout.
+        self.results_dir = self.state / "injection" / "results-tools"
         self.results_dir.mkdir(parents=True)
         self.f = self.root / "code.py"
         self.f.write_text("x = 1\n")
@@ -1590,7 +1636,7 @@ class TestReportFormatCLI(unittest.TestCase):
         # what run_scanner derives - otherwise the scanner will try to call
         # pi and create an error cache entry, exiting 2.
         self.p_hash = ss.prompt_hash(ss.load_prompt_template(ss.OWASP_SCANNERS["B3"]))
-        (self.state / "discovery.json").write_text(
+        (self.state / "discovery-tools.json").write_text(
             json.dumps({"B3": [".py"]})
         )
 
@@ -1600,7 +1646,7 @@ class TestReportFormatCLI(unittest.TestCase):
     def _write_finding(self, rel, vulns):
         filepath = self.root / rel
         c_hash = ss.content_hash(filepath.read_bytes())
-        key = ss.file_key(rel, "injection", c_hash, self.p_hash)
+        key = ss.file_key(rel, "injection", c_hash, self.p_hash, "off")
         data = {
             "file": rel, "scanner": "injection", "status": "ok",
             "result": vulns, "content_hash": c_hash,
@@ -3423,6 +3469,235 @@ class TestRefutationFirstVerifyPrompt(unittest.TestCase):
             )
         self.assertEqual(result["verifications"]["1"]["verdict"], "confirmed")
         tmp.cleanup()
+
+
+# ── Ticket 04: Refuted/not-actionable re-bucketing + confirmed-only gate ───
+
+
+class TestRefutationBuckets(unittest.TestCase):
+    """Ticket 04: build_report consumes verdicts under refutation-first
+    semantics. Refuted findings leave Vulnerable Files, the Risk Heatmap,
+    and the CI gate and appear in a skim-only Refuted section with their
+    evidence. Not-actionable findings (confirmed but unreachable:
+    exploitable no/conditional) are re-bucketed below the line without
+    being suppressed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.results_dir = self.state / "injection" / "results"
+        self.results_dir.mkdir(parents=True)
+        self.verify_dir = self.state / "injection" / "verifications"
+        self.verify_dir.mkdir(parents=True)
+        self.output = self.root / "report.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _seed(self, rel, vulns, verifications=None):
+        c_hash = "abc"
+        (self.results_dir / f"{rel.replace('/', '_')}.json").write_text(
+            json.dumps({
+                "file": rel, "scanner": "injection", "status": "ok",
+                "result": vulns, "content_hash": c_hash,
+            })
+        )
+        if verifications is not None:
+            vph = ss.prompt_hash(ss.load_verify_prompt())
+            f_sig = ss.findings_signature(vulns)
+            key = ss.verify_file_key(rel, "injection", c_hash, f_sig, vph)
+            (self.verify_dir / f"{key}.json").write_text(json.dumps({
+                "file": rel, "scanner": "injection", "status": "ok",
+                "verifications": verifications, "findings_signature": f_sig,
+                "verify_prompt_hash": vph, "content_hash": c_hash,
+            }))
+
+    def _vulns(self):
+        return [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+            {"line": 2, "severity": "Critical", "code": "y",
+             "explanation": "", "fix": ""},
+            {"line": 3, "severity": "Medium", "code": "z",
+             "explanation": "", "fix": ""},
+            {"line": 4, "severity": "Low", "code": "w",
+             "explanation": "", "fix": ""},
+            {"line": 5, "severity": "High", "code": "v",
+             "explanation": "", "fix": "", "tags": ["unsubstantiated"]},
+        ]
+
+    def _seed_all_verdicts(self):
+        """Five findings, five buckets:
+        1 confirmed+yes, 2 refuted, 3 not-actionable (no),
+        4 not-actionable (conditional), 5 confirmed+yes but unsubstantiated."""
+        self._seed("a.py", self._vulns(), {
+            "1": {"verdict": "confirmed", "confidence": "High",
+                  "exploitable": "yes",
+                  "verification_reason": "taint path from HTTP handler"},
+            "2": {"verdict": "refuted", "confidence": "High",
+                  "exploitable": "no",
+                  "verification_reason": "refuted: parameterized by QueryBuilder (db/qb.py:42)"},
+            "3": {"verdict": "confirmed", "confidence": "Medium",
+                  "exploitable": "no",
+                  "verification_reason": "dead code — function has no callers"},
+            "4": {"verdict": "confirmed", "confidence": "Medium",
+                  "exploitable": "conditional",
+                  "verification_reason": "only reachable with admin role"},
+            "5": {"verdict": "confirmed", "confidence": "High",
+                  "exploitable": "yes",
+                  "verification_reason": "taint path holds"},
+        })
+
+    def test_refuted_leaves_counts_heatmap_and_gate(self):
+        self._seed_all_verdicts()
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        # Refuted finding (Critical) is out of the severity totals
+        self.assertEqual(stats["severity_counts"]["Critical"], 0)
+        self.assertEqual(stats["refuted_count"], 1)
+        text = self.output.read_text()
+        self.assertIn("Refuted", text)
+        self.assertIn("refuted: parameterized by QueryBuilder", text)
+        # Not in Vulnerable Files section
+        self.assertNotIn("| `a.py` | 1 |", text)  # placeholder replaced below
+
+    def test_refuted_section_has_evidence_and_not_findings_detail(self):
+        self._seed_all_verdicts()
+        ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        text = self.output.read_text()
+        # Evidence is shown in the Refuted section
+        self.assertIn("refuted: parameterized by QueryBuilder (db/qb.py:42)", text)
+        # The refuted finding is not rendered in the per-file findings detail
+        self.assertNotIn("[VULN] a.py — 5 issue(s)", text)
+
+    def test_not_actionable_rebucketed_below_the_line(self):
+        self._seed_all_verdicts()
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertEqual(stats["not_actionable_count"], 2)
+        text = self.output.read_text()
+        self.assertIn("Not-Actionable", text)
+        self.assertIn("dead code — function has no callers", text)
+        self.assertIn("only reachable with admin role", text)
+        # Not suppressed and not in the allowlist section
+        self.assertEqual(stats["suppressed_count"], 0)
+
+    def test_confirmed_findings_stay_in_counts(self):
+        self._seed_all_verdicts()
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        # Findings 1 and 5 are confirmed + exploitable: yes
+        self.assertEqual(stats["severity_counts"]["High"], 2)
+        self.assertEqual(stats["confirmed_count"], 2)
+
+    def test_unverified_findings_still_count_raw(self):
+        vulns = self._vulns()[:1]
+        self._seed("b.py", vulns)  # no verification seeded
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertEqual(stats["severity_counts"]["High"], 1)
+        self.assertEqual(stats["confirmed_count"], 0)
+
+    def test_fail_on_confidence_counts_only_confirmed(self):
+        self._seed_all_verdicts()
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            confidence_threshold="high",
+        )
+        # Gated counts exclude refuted and not-actionable entirely
+        gated = stats["severity_counts_gated"]
+        self.assertEqual(gated["High"], 2)
+        self.assertEqual(gated["Critical"], 0)
+        self.assertEqual(gated["Medium"], 0)
+        self.assertEqual(gated["Low"], 0)
+
+    def test_per_scanner_summary_shows_bucket_counts(self):
+        self._seed_all_verdicts()
+        ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        text = self.output.read_text()
+        self.assertIn("| Confirmed | 2 |", text)
+        self.assertIn("| Refuted | 1 |", text)
+        self.assertIn("| Not-Actionable | 2 |", text)
+        self.assertIn("| Unsubstantiated (no named source) | 1 |", text)
+
+    def test_suppressed_findings_work_alongside_new_buckets(self):
+        vulns = self._vulns()[:2]
+        self._seed("a.py", vulns, {
+            "1": {"verdict": "confirmed", "confidence": "High",
+                  "exploitable": "yes", "verification_reason": "r"},
+            "2": {"verdict": "refuted", "confidence": "High",
+                  "exploitable": "no", "verification_reason": "refuted: safe"},
+        })
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]},
+            allowlist=[{"scanner": "B3", "file": "a.py", "line": 1,
+                        "reason": "human-confirmed FP"}],
+        )
+        self.assertEqual(stats["suppressed_count"], 1)
+        self.assertEqual(stats["refuted_count"], 1)
+        self.assertEqual(stats["confirmed_count"], 0)
+        text = self.output.read_text()
+        self.assertIn("human-confirmed FP", text)
+
+    def test_legacy_verdicts_without_verdict_field_bucket_safely(self):
+        """Cached verdicts from before the refutation-first prompt have no
+        "verdict" field; derive the bucket from exploitable/confidence."""
+        self._seed("a.py", self._vulns()[:3], {
+            "1": {"confidence": "High", "exploitable": "yes", "verification_reason": "r"},
+            "2": {"confidence": "Low", "exploitable": "no",
+                  "verification_reason": "sanitized upstream by helper()"},
+            "3": {"confidence": "Medium", "exploitable": "conditional",
+                  "verification_reason": "admin role required"},
+        })
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertEqual(stats["confirmed_count"], 1)
+        self.assertEqual(stats["refuted_count"], 1)
+        self.assertEqual(stats["not_actionable_count"], 1)
+
+    def test_no_verification_keeps_legacy_behavior(self):
+        self._seed("a.py", self._vulns()[:2])  # no verification at all
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertEqual(stats["severity_counts"]["High"], 1)
+        self.assertEqual(stats["severity_counts"]["Critical"], 1)
+        self.assertEqual(stats["refuted_count"], 0)
+        self.assertEqual(stats["not_actionable_count"], 0)
+
+    def test_refuted_findings_available_for_export(self):
+        self._seed_all_verdicts()
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        refuted = stats["refuted_findings"]
+        self.assertEqual(len(refuted), 1)
+        entry = refuted[0]
+        self.assertEqual(entry["scanner"], "B3")
+        self.assertEqual(entry["file"], "a.py")
+        self.assertEqual(entry["line"], 2)
+        self.assertIn("parameterized", entry["reason"])
 
 
 if __name__ == "__main__":

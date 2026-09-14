@@ -27,6 +27,10 @@ to rate each finding's confidence and exploitability in the context of the file 
   (`--no-progress` to silence)
 - **Tools-on scan by default** (`--no-scan-tools` to opt out): phase 2 runs with read-only
   tools so the scanner can inspect callers, sanitizers, and auth middleware in related files
+- **Refutation-first report buckets** (when verification ran): refuted findings leave
+  Vulnerable Files, the heatmap, and the CI gate and appear in a skim-only Refuted section;
+  not-actionable findings (real but unreachable) are re-bucketed below the line without
+  being suppressed; `--fail-on-confidence` counts only confirmed findings
 - Concurrent scans (`--concurrency`)
 - Dry-run mode (`--dry-run`) for previewing which files would be scanned
 - Override the per-scanner extension list (`--formats`)
@@ -308,7 +312,7 @@ each is independently grep-able.
 | `--scan-timeout N` | `180` | Per-file `pi` call timeout in seconds. |
 | `--discovery-timeout N` | `240` | Discovery `pi` call timeout in seconds. |
 | `--fail-on LEVEL` | `never` | Exit non-zero if any finding is at or above `LEVEL` (one of `low`, `medium`, `high`, `critical`). Independent of `--fail-on-confidence`. |
-| `--fail-on-confidence LEVEL` | `never` | Exit non-zero if any finding whose verifier confidence is at or above `LEVEL` is present (one of `low`, `medium`, `high`). Unverified findings are treated as below any threshold. |
+| `--fail-on-confidence LEVEL` | `never` | Exit non-zero if any **confirmed** finding whose verifier confidence is at or above `LEVEL` is present (one of `low`, `medium`, `high`). Under refutation-first semantics, refuted and not-actionable findings never trip the gate. Unverified findings are treated as below any threshold. Independent of `--fail-on`. |
 | `--report-format FMT` | `md` | Output format: `md` (human-readable markdown, default), `csv` or `tsv` (one row per finding, for spreadsheet import). The file extension on `--output` is auto-adjusted to match. |
 | `--discovery-tools` / `--no-discovery-tools` | on | Give phase 1 (discovery) read-only tools (`read`,`grep`,`find`,`ls`). The model can browse the repo before deciding which extensions matter. |
 | `--scan-tools` / `--no-scan-tools` | on | Give phase 2 (scan) read-only tools. On by default — the scanner can inspect callers, sanitizers, and auth middleware in related files. `--no-scan-tools` for the cheaper single-file scan. |
@@ -441,12 +445,20 @@ and contains:
 - A header with the timestamp, repo path, selected scanners, and (when applicable) a note
   that phase-3 verification verdicts are included and a confidence gate is in effect
 - One section per scanner with: extensions scanned, file/vulnerability counts, severity
-  breakdown, suppressed count, clean count, errors, and — when verification ran — a
-  per-confidence breakdown (High / Medium / Low / Unverified) plus a needs-review count
+  breakdown, suppressed count, unsubstantiated count, clean count, errors, and — when
+  verification ran — confirmed / refuted / not-actionable counts plus a per-confidence
+  breakdown (High / Medium / Low / Unverified) and a needs-review count
 - A `<details>` block with the full per-file findings (line number, code snippet, why, fix,
-  and verifier annotation)
+  taint path, unsubstantiated tag, and verifier annotation)
 - A **Suppressed Findings** section (collapsed) listing allowlist hits with their reasons
-- A **Global Summary** table and an OWASP risk heatmap
+- A **Refuted Findings** section (when the refuter killed findings) showing each
+  refutation's cited evidence — skim-only, excluded from Vulnerable Files, the heatmap,
+  and the CI gate
+- A **Not-Actionable Findings (below the line)** section for confirmed-but-unreachable
+  findings (dead code, test-only, defense-in-depth) — re-bucketed, never suppressed, and
+  never written to the allowlist
+- A **Global Summary** table and an OWASP risk heatmap (reflected counts: refuted and
+  not-actionable findings are out)
 - An **Overall Risk** line that is `INCONCLUSIVE` when there were zero findings but errors or
   timeouts occurred (so a green report after a flaky run is not mistaken for a clean repo)
 - A **Needs Review** section (only when verification produced below-threshold findings) that
@@ -483,7 +495,7 @@ Columns (in order):
 | `confidence` | Verifier verdict (`High` / `Medium` / `Low`), blank when no verification has run |
 | `exploitable` | Verifier verdict (`yes` / `no` / `conditional`), blank when no verification has run |
 | `verification_reason` | Verifier's one-line justification |
-| `status` | `active` (above any confidence gate), `needs_review` (below gate), `suppressed` (allowlist hit), `error` / `timeout` (per-file scan failure) |
+| `status` | `active` (confirmed and above any confidence gate), `needs_review` (below gate), `refuted` (verifier killed it — leaves all counts and the gate), `not_actionable` (confirmed but unreachable — dead code, test-only, defense-in-depth), `suppressed` (allowlist hit), `error` / `timeout` (per-file scan failure) |
 | `suppression_reason` | Free-text reason from the allowlist entry (suppressed rows only) |
 
 Typical filter recipes once the file is in a spreadsheet:

@@ -1855,6 +1855,59 @@ SEVERITY_ORDER = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
 # threshold comparisons can use a single `>=` check.
 CONFIDENCE_ORDER = {"High": 3, "Medium": 2, "Low": 1, "Unverified": 0, "Unknown": 0}
 
+# Report buckets under refutation-first semantics (docs/adr/0001):
+#
+#   "refuted"        — the verifier called the finding a misread (verdict
+#                      "refuted", or a legacy verdict that is Low/no). Leaves
+#                      Vulnerable Files, the Risk Heatmap, and the CI gate;
+#                      appears in the skim-only Refuted section with evidence.
+#   "not_actionable" — real but unreachable (confirmed verdict with
+#                      exploitable "no"/"conditional": dead code, test-only
+#                      caller, defense-in-depth). Re-bucketed below the line,
+#                      never suppressed, never allowlisted — resurrects if the
+#                      code path wakes up (content-hash cache invalidation).
+#   "confirmed"      — the refuter failed to kill it: stays in Vulnerable
+#                      Files, the heatmap, and the CI gate.
+#   "unverified"     — no verdict for this finding; legacy counting applies.
+
+
+def verdict_bucket(vfd: dict | None) -> str:
+    """Map a phase-3 verification record to a report bucket.
+
+    Returns one of "refuted", "not_actionable", "confirmed", "unverified".
+
+    `vfd` is the line-keyed verification record from the verify cache
+    (keys: verdict, confidence, exploitable, verification_reason), or None
+    when the finding was never verified.
+
+    Bucket rules:
+    - no record                          → "unverified"
+    - verdict == "refuted"               → "refuted"
+    - verdict == "confirmed"             → exploitable "yes" → "confirmed";
+                                           "no"/"conditional" → "not_actionable"
+    - legacy record without a "verdict"  → derived: exploitable "no" or
+                                           confidence "Low" → "refuted";
+                                           exploitable "conditional" →
+                                           "not_actionable"; else "confirmed"
+    """
+    if not vfd:
+        return "unverified"
+    verdict = vfd.get("verdict")
+    exploitable = vfd.get("exploitable")
+    confidence = vfd.get("confidence")
+    if verdict == "refuted":
+        return "refuted"
+    if verdict == "confirmed":
+        if exploitable == "yes":
+            return "confirmed"
+        return "not_actionable"
+    # Legacy verdicts (pre-refutation-first caches) carry no verdict field.
+    if exploitable == "no" or confidence == "Low":
+        return "refuted"
+    if exploitable == "conditional":
+        return "not_actionable"
+    return "confirmed"
+
 
 def load_allowlist(state_dir: Path) -> list[dict]:
     """Load the false-positive allowlist from <state_dir>/allowlist.json.
@@ -1984,6 +2037,8 @@ def build_report(
     needs_review_global: list[dict] = []
     suppressed_count_global = 0
     unsubstantiated_count_global = 0
+    refuted_findings_global: list[dict] = []
+    not_actionable_global: list[dict] = []
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = []
 
@@ -2013,6 +2068,7 @@ def build_report(
     global_vuln_count = 0
     global_error_count = 0
     global_clean_count = 0
+    confirmed_count_global = 0
     global_scanned_count = 0
     suppressed_findings: list[dict] = []
 
@@ -2033,6 +2089,10 @@ def build_report(
         confidence_counts = {"High": 0, "Medium": 0, "Low": 0, "Unverified": 0}
         suppressed_scanner = 0
         unsubstantiated_scanner = 0
+        refuted_scanner = 0
+        not_actionable_scanner = 0
+        confirmed_scanner = 0
+        unverified_scanner = 0
         no_vulns = 0
         errors = 0
         files_with_vulns = []
@@ -2111,25 +2171,56 @@ def build_report(
                     scanner_verify_dir, verify_prompt_hash_value,
                 ) or {}
 
+            # Refutation-first bucketing: every non-suppressed finding lands
+            # in exactly one of refuted / not_actionable / confirmed /
+            # unverified. Refuted and not-actionable findings leave the
+            # severity counts, the heatmap, the Vulnerable Files table, and
+            # the CI gate; they are rendered in their own sections below.
             for v in active:
                 try:
                     line_key = str(int(v.get("line")))
                 except (TypeError, ValueError):
                     line_key = ""
                 vfd = verifications.get(line_key) or {}
-                conf = vfd.get("confidence", "Unverified")
+                bucket = verdict_bucket(vfd or None)
+                conf = vfd.get("confidence", "Unverified") if vfd else "Unverified"
                 if conf not in confidence_counts:
                     conf = "Unverified"
                 v["_confidence"] = conf
-                v["_exploitable"] = vfd.get("exploitable", "unknown")
-                v["_verification_reason"] = vfd.get("verification_reason", "")
+                v["_exploitable"] = vfd.get("exploitable", "unknown") if vfd else "unknown"
+                v["_verification_reason"] = vfd.get("verification_reason", "") if vfd else ""
+                v["_verdict"] = vfd.get("verdict", "") if vfd else ""
+                v["_bucket"] = bucket
+
+                if bucket == "refuted":
+                    refuted_findings_global.append({
+                        "scanner": scanner_id,
+                        "file": rel,
+                        "line": v.get("line"),
+                        "severity": v.get("severity", "Unknown"),
+                        "reason": v["_verification_reason"] or "(no evidence given)",
+                    })
+                    refuted_scanner += 1
+                elif bucket == "not_actionable":
+                    not_actionable_global.append({
+                        "scanner": scanner_id,
+                        "file": rel,
+                        "vuln": v,
+                    })
+                    not_actionable_scanner += 1
+                elif bucket == "confirmed":
+                    confirmed_scanner += 1
+                else:
+                    unverified_scanner += 1
+
+            above_line = [v for v in active if v.get("_bucket") not in ("refuted", "not_actionable")]
 
             if not vulns:
                 no_vulns += 1
                 global_clean_count += 1
             else:
-                files_with_vulns.append((rel, len(active)))
-                for v in active:
+                files_with_vulns.append((rel, len(above_line)))
+                for v in above_line:
                     sev = v.get("severity", "Unknown")
                     if sev in sev_counts:
                         sev_counts[sev] += 1
@@ -2141,7 +2232,8 @@ def build_report(
                 all_findings.append({
                     "file": rel,
                     "status": status,
-                    "vulns": active,
+                    "vulns": above_line,
+                    "total_vulns": len(vulns),
                     "result": result_raw,
                 })
 
@@ -2149,6 +2241,7 @@ def build_report(
         scanner_vuln_count = sum(sev_counts.values())
         global_vuln_count += scanner_vuln_count
         unsubstantiated_count_global += unsubstantiated_scanner
+        confirmed_count_global += confirmed_scanner
         files_with_vulns.sort(key=lambda x: -x[1])
 
         # Compute per-scanner gated counts (only findings at or above the
@@ -2190,6 +2283,10 @@ def build_report(
         w(f"| Low | {sev_counts['Low']} |")
         w(f"| Suppressed (allowlisted) | {suppressed_scanner} |")
         w(f"| Unsubstantiated (no named source) | {unsubstantiated_scanner} |")
+        if has_verification_data:
+            w(f"| Confirmed | {confirmed_scanner} |")
+            w(f"| Refuted | {refuted_scanner} |")
+            w(f"| Not-Actionable | {not_actionable_scanner} |")
         w(f"| Clean files | {no_vulns} |")
         w(f"| Errors | {errors} |")
         if has_verification_data:
@@ -2261,9 +2358,17 @@ def build_report(
                     continue
 
                 if not vulns:
-                    w(f"#### [CLEAN] {rel}")
-                    w()
-                    w("**No issues found**")
+                    total = entry.get("total_vulns", 0)
+                    if total:
+                        w(f"#### [REFUTED] {rel} — all {total} finding(s) "
+                          "refuted or not-actionable")
+                        w()
+                        w("See the Refuted / Not-Actionable sections below the "
+                          "line for the cited evidence.")
+                    else:
+                        w(f"#### [CLEAN] {rel}")
+                        w()
+                        w("**No issues found**")
                     w()
                     continue
 
@@ -2338,6 +2443,9 @@ def build_report(
     w(f"| Clean files | {global_clean_count} |")
     w(f"| Errors/timeouts | {global_error_count} |")
     if has_verification_data:
+        w(f"| Confirmed | {confirmed_count_global} |")
+        w(f"| Refuted | {len(refuted_findings_global)} |")
+        w(f"| Not-Actionable (below the line) | {len(not_actionable_global)} |")
         verified_total = (
             confidence_counts_global['High']
             + confidence_counts_global['Medium']
@@ -2367,6 +2475,38 @@ def build_report(
             w(f"- `{sf['scanner']}` `{sf['file']}:{line_num}` — `{severity}` — {sf['reason']}")
         w()
         w("</details>")
+        w()
+
+    if refuted_findings_global:
+        w("### Refuted Findings")
+        w()
+        w("The phase-3 refuter dismissed these findings as misreads (the flagged "
+          "pattern is actually safe). They are **excluded** from Vulnerable "
+          "Files, the Risk Heatmap, and the CI gate. Skim the reasons below — "
+          "each cites the evidence that proves the finding safe; do not re-read "
+          "the code. Machine refutations are never auto-suppressed: if you "
+          "agree with one, promote it to `.security_scan/allowlist.json` "
+          "yourself (or export candidates with `--export-allowlist-candidates`).")
+        w()
+        for rf in refuted_findings_global:
+            w(f"- `{rf['scanner']}` `{rf['file']}:{rf['line']}` — `{rf['severity']}` — {rf['reason']}")
+        w()
+
+    if not_actionable_global:
+        w("### Not-Actionable Findings (below the line)")
+        w()
+        w("These findings are real but unreachable in this codebase: dead code, "
+          "test-only callers, or defense-in-depth paths. They are re-bucketed "
+          "below the line — **not suppressed** — so they resurrect if the code "
+          "path wakes up (the content-hash cache invalidates naturally). They "
+          "are deliberately kept out of the allowlist.")
+        w()
+        for na in not_actionable_global:
+            v = na["vuln"]
+            line_num = v.get("line", "?")
+            severity = v.get("severity", "Unknown")
+            reason = v.get("_verification_reason", "")
+            w(f"- `{na['scanner']}` `{na['file']}:{line_num}` — `{severity}` — {reason or '(no reason given)'}")
         w()
 
     # OWASP risk matrix
@@ -2489,6 +2629,9 @@ def build_report(
         print()
         print("  Verification:")
         print(f"    Coverage:        {verified_total}/{active_total}")
+        print(f"    Confirmed:       {confirmed_count_global}")
+        print(f"    Refuted:         {len(refuted_findings_global)}")
+        print(f"    Not-Actionable:  {len(not_actionable_global)}")
         print(f"    High confidence: {confidence_counts_global['High']}")
         print(f"    Medium:          {confidence_counts_global['Medium']}")
         print(f"    Low:             {confidence_counts_global['Low']}")
@@ -2524,6 +2667,10 @@ def build_report(
         "unverified_count": confidence_counts_global['Unverified'],
         "suppressed_count": suppressed_count_global,
         "unsubstantiated_count": unsubstantiated_count_global,
+        "confirmed_count": confirmed_count_global,
+        "refuted_count": len(refuted_findings_global),
+        "not_actionable_count": len(not_actionable_global),
+        "refuted_findings": list(refuted_findings_global),
         "error_count": global_error_count,
         "scanned_count": global_scanned_count,
     }
@@ -2533,8 +2680,9 @@ def build_report(
 
 CSV_FIELDNAMES = [
     "scanner", "scanner_label", "file", "line", "severity",
-    "code", "explanation", "fix", "confidence", "exploitable",
-    "verification_reason", "status", "suppression_reason",
+    "code", "explanation", "fix", "source", "sink", "tags",
+    "confidence", "exploitable", "verification_reason", "verdict",
+    "status", "suppression_reason",
 ]
 
 REPORT_FORMAT_EXTENSIONS = {"md": ".md", "csv": ".csv", "tsv": ".tsv"}
@@ -2626,6 +2774,10 @@ def build_csv_report(
     )
     suppressed_count = 0
     needs_review_count = 0
+    refuted_count = 0
+    not_actionable_count = 0
+    unsubstantiated_count = 0
+    confirmed_count = 0
     error_count = 0
     scanned_count = 0
     rows: list[dict] = []
@@ -2665,9 +2817,13 @@ def build_csv_report(
                     "code": "",
                     "explanation": "",
                     "fix": "",
+                    "source": "",
+                    "sink": "",
+                    "tags": "",
                     "confidence": "",
                     "exploitable": "",
                     "verification_reason": "",
+                    "verdict": "",
                     "status": status,
                     "suppression_reason": "",
                 })
@@ -2732,9 +2888,13 @@ def build_csv_report(
                     "code": v.get("code", ""),
                     "explanation": v.get("explanation", ""),
                     "fix": v.get("fix", ""),
+                    "source": v.get("source", "") if isinstance(v.get("source"), str) else "",
+                    "sink": v.get("sink", "") if isinstance(v.get("sink"), str) else "",
+                    "tags": ",".join(t for t in (v.get("tags") or []) if isinstance(t, str)),
                     "confidence": "" if conf == "Unverified" else conf,
                     "exploitable": vfd.get("exploitable", ""),
                     "verification_reason": vfd.get("verification_reason", ""),
+                    "verdict": vfd.get("verdict", ""),
                 }
 
                 if sup is not None:
@@ -2744,15 +2904,37 @@ def build_csv_report(
                     suppressed_count += 1
                     continue
 
-                # Non-suppressed: contributes to raw severity_counts. The
+                if UNSUBSTANTIATED_TAG in (v.get("tags") or []):
+                    unsubstantiated_count += 1
+
+                # Refutation-first bucketing, mirroring build_report: refuted
+                # and not-actionable rows keep their verification data but
+                # leave the severity counts, the gated counts, and the CI gate.
+                bucket = verdict_bucket(vfd or None)
+                sev = v.get("severity", "")
+                if bucket == "refuted":
+                    rows.append({**base_row,
+                                 "status": "refuted",
+                                 "suppression_reason": ""})
+                    refuted_count += 1
+                    continue
+                if bucket == "not_actionable":
+                    rows.append({**base_row,
+                                 "status": "not_actionable",
+                                 "suppression_reason": ""})
+                    not_actionable_count += 1
+                    continue
+
+                # Confirmed/unverified: contributes to raw severity_counts. The
                 # status column tells the user whether the row is gated in
                 # (active) or gated out (needs_review) under the current
                 # confidence threshold; severity_counts_gated below tracks
                 # only the active subset.
-                sev = v.get("severity", "")
                 is_below = CONFIDENCE_ORDER.get(conf, 0) < cutoff
                 if sev in severity_counts:
                     severity_counts[sev] += 1
+                if bucket == "confirmed":
+                    confirmed_count += 1
                 if has_threshold and is_below:
                     rows.append({**base_row,
                                  "status": "needs_review",
@@ -2779,6 +2961,8 @@ def build_csv_report(
     active_count = sum(1 for r in rows if r["status"] == "active")
     needs_review_rows = sum(1 for r in rows if r["status"] == "needs_review")
     suppressed_rows = sum(1 for r in rows if r["status"] == "suppressed")
+    refuted_rows = sum(1 for r in rows if r["status"] == "refuted")
+    not_actionable_rows = sum(1 for r in rows if r["status"] == "not_actionable")
     error_rows = sum(1 for r in rows if r["status"] in ("error", "timeout"))
 
     print()
@@ -2788,6 +2972,8 @@ def build_csv_report(
     print(f"  Rows:           {len(rows)}")
     print(f"  Active:         {active_count}")
     print(f"  Needs review:   {needs_review_rows}")
+    print(f"  Refuted:        {refuted_rows}")
+    print(f"  Not-Actionable: {not_actionable_rows}")
     print(f"  Suppressed:     {suppressed_rows}")
     print(f"  Errors:         {error_rows}")
     print()
@@ -2801,6 +2987,20 @@ def build_csv_report(
         "verified_count": sum(confidence_counts[k] for k in ("High", "Medium", "Low")),
         "unverified_count": confidence_counts["Unverified"],
         "suppressed_count": suppressed_count,
+        "unsubstantiated_count": unsubstantiated_count,
+        "confirmed_count": confirmed_count,
+        "refuted_count": refuted_rows,
+        "not_actionable_count": not_actionable_rows,
+        "refuted_findings": [
+            {
+                "scanner": r["scanner"],
+                "file": r["file"],
+                "line": int(r["line"]) if str(r.get("line", "")).isdigit() else r.get("line", 0),
+                "severity": r["severity"],
+                "reason": r["verification_reason"] or "(no evidence given)",
+            }
+            for r in rows if r["status"] == "refuted"
+        ],
         "error_count": error_count,
         "scanned_count": scanned_count,
     }
@@ -2963,9 +3163,11 @@ OWASP 2025 Categories:
         "--fail-on-confidence",
         choices=["never", "low", "medium", "high"],
         default="never",
-        help="Exit non-zero if a finding whose verifier confidence is at or above "
-             "this level is found. Only checks findings at or above the confidence "
-             "threshold (not raw findings). Independent of --fail-on. "
+        help="Exit non-zero if a CONFIRMED finding whose verifier confidence is at or "
+             "above this level is found. Under refutation-first semantics only "
+             "confirmed findings count — refuted and not-actionable (unreachable) "
+             "findings never trip the gate. Unverified findings are treated as below "
+             "any threshold. Independent of --fail-on. "
              "(default: never — always exit 0)",
     )
     parser.add_argument(
