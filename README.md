@@ -344,8 +344,19 @@ The model is expected to reply to scanner prompts with either an empty JSON arra
 entry per finding in this shape:
 
 ```json
-[{"line": 123, "code": "...", "severity": "High", "explanation": "...", "fix": "..."}]
+[{"line": 123, "code": "...", "severity": "High", "explanation": "...", "fix": "...",
+  "source": "where untrusted input enters", "sink": "where it becomes dangerous"}]
 ```
+
+Every finding must name its taint path (`source` → `sink`). The prompts also carry a
+**negative-evidence section** listing safe patterns the scanner must not flag
+(parameterized ORM/query-builder calls, logging of constants, values that never cross a
+trust boundary, test fixtures, defense-in-depth wrappers).
+
+Post-parse (no extra model calls), a finding without a non-empty string `source` is tagged
+`"tags": ["unsubstantiated"]`. The tag shows up in the report and rides along in the
+findings payload handed to the verifier, which treats it as extra scrutiny — never as a
+reason to skip verification.
 
 The verify prompt expects an array (one entry per input finding) in this shape:
 

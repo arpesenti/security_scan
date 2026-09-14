@@ -57,6 +57,12 @@ input). Use exactly the line numbers from the input — do not change them.
 If a finding's line number does not match any real issue in the file, mark it
 as exploitable: "no" and confidence: "Low".
 
+A finding may also carry a "tags" array. A tag of "unsubstantiated" means the
+scanner could not name a taint source for it — treat that as a signal to
+scrutinize that finding EXTRA hard (reconstruct the taint path yourself from
+the file content); it does NOT mean the finding should be skipped, and the
+finding still requires its own verdict.
+
 --- FINDINGS (from automated scan, in order) ---
 {findings_json}
 --- END OF FINDINGS ---

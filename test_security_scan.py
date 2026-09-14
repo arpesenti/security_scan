@@ -3066,5 +3066,243 @@ class TestScanToolsDefaultCLI(unittest.TestCase):
         self.assertIn("--no-scan-tools", proc.stdout)
 
 
+# ── Ticket 02: Source/sink discipline ──────────────────────────────────────
+
+
+class TestTagUnsubstantiated(unittest.TestCase):
+    """Ticket 02: findings without a named source carry the
+    `unsubstantiated` tag after parsing, with no extra model calls."""
+
+    def test_source_present_no_tag(self):
+        findings = [{"line": 1, "source": "req.body", "sink": "db.query"}]
+        ss.tag_unsubstantiated(findings)
+        self.assertNotIn("unsubstantiated", findings[0].get("tags", []))
+
+    def test_source_absent_tagged(self):
+        findings = [{"line": 1, "sink": "db.query"}]
+        ss.tag_unsubstantiated(findings)
+        self.assertIn("unsubstantiated", findings[0]["tags"])
+
+    def test_source_empty_or_whitespace_tagged(self):
+        findings = [{"line": 1, "source": ""}, {"line": 2, "source": "   "}]
+        ss.tag_unsubstantiated(findings)
+        self.assertIn("unsubstantiated", findings[0]["tags"])
+        self.assertIn("unsubstantiated", findings[1]["tags"])
+
+    def test_source_malformed_non_string_tagged(self):
+        for bad in (42, None, True, ["req"], {"a": 1}):
+            findings = [{"line": 1, "source": bad}]
+            ss.tag_unsubstantiated(findings)
+            self.assertIn("unsubstantiated", findings[0]["tags"])
+
+    def test_no_findings_list_untouched(self):
+        findings = []
+        ss.tag_unsubstantiated(findings)
+        self.assertEqual(findings, [])
+
+    def test_non_dict_entries_ignored(self):
+        findings = ["oops", {"line": 1}]
+        ss.tag_unsubstantiated(findings)
+        self.assertEqual(findings[0], "oops")
+        self.assertIn("unsubstantiated", findings[1]["tags"])
+
+    def test_existing_other_tags_preserved(self):
+        findings = [{"line": 1, "tags": ["reviewed"]}]
+        ss.tag_unsubstantiated(findings)
+        self.assertEqual(findings[0]["tags"], ["reviewed", "unsubstantiated"])
+
+    def test_idempotent(self):
+        findings = [{"line": 1}]
+        ss.tag_unsubstantiated(findings)
+        ss.tag_unsubstantiated(findings)
+        self.assertEqual(findings[0]["tags"], ["unsubstantiated"])
+
+    def test_returns_same_list(self):
+        findings = [{"line": 1}]
+        out = ss.tag_unsubstantiated(findings)
+        self.assertIs(out, findings)
+
+
+class TestScanPromptSourceSink(unittest.TestCase):
+    """Ticket 02: every scan prompt requires source/sink and carries the
+    negative-evidence section; so does the built-in fallback."""
+
+    NEGATIVE_EVIDENCE_MARKERS = (
+        "Do NOT flag",
+        "Parameterized queries, prepared statements",
+        "Test fixtures and test-only code paths",
+        "never cross a trust boundary",
+    )
+
+    def test_all_scanner_prompt_files_require_source_and_sink(self):
+        for sid, cfg in ss.OWASP_SCANNERS.items():
+            path = ss.PROMPTS_DIR / cfg["prompt_file"]
+            self.assertTrue(path.exists(), f"{sid} prompt missing: {path}")
+            text = path.read_text()
+            self.assertIn('"source"', text,
+                          f"{sid} prompt must require a source field")
+            self.assertIn('"sink"', text,
+                          f"{sid} prompt must require a sink field")
+
+    def test_all_scanner_prompt_files_have_negative_evidence(self):
+        for sid, cfg in ss.OWASP_SCANNERS.items():
+            text = (ss.PROMPTS_DIR / cfg["prompt_file"]).read_text()
+            for marker in self.NEGATIVE_EVIDENCE_MARKERS:
+                self.assertIn(marker, text,
+                              f"{sid} prompt missing negative evidence marker {marker!r}")
+
+    def test_builtin_fallback_has_source_sink_and_negative_evidence(self):
+        # Remove a prompt file temporarily to exercise the built-in fallback.
+        cfg = ss.OWASP_SCANNERS["B3"]
+        path = ss.PROMPTS_DIR / cfg["prompt_file"]
+        backup = path.read_text()
+        try:
+            path.unlink()
+            text = ss.load_prompt_template(cfg)
+            self.assertIn('"source"', text)
+            self.assertIn('"sink"', text)
+            for marker in self.NEGATIVE_EVIDENCE_MARKERS:
+                self.assertIn(marker, text)
+        finally:
+            path.write_text(backup)
+
+    def test_scan_file_tags_findings_without_source(self):
+        """scan_file tags post-parse, so the cached result carries the tag."""
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        results = root / "state" / "injection" / "results"
+        results.mkdir(parents=True)
+        sessions = root / "sessions"
+        sessions.mkdir()
+        f = root / "code.py"
+        f.write_text("query(input)\n")
+        raw = json.dumps([{
+            "line": 1, "code": "query(input)", "severity": "High",
+            "explanation": "e", "fix": "f", "source": "", "sink": "db",
+        }])
+        with patch.object(ss, "call_pi", return_value=("ok", raw)):
+            result = ss.scan_file(
+                f, ss.OWASP_SCANNERS["B3"], root, results, sessions,
+                "FILE: {filename}\n{file_content}",
+                prompt_hash_value="phash", timeout=60,
+            )
+        self.assertEqual(result["result"][0]["tags"], ["unsubstantiated"])
+        tmp.cleanup()
+
+    def test_scan_file_keeps_untagged_when_source_named(self):
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        results = root / "state" / "injection" / "results"
+        results.mkdir(parents=True)
+        sessions = root / "sessions"
+        sessions.mkdir()
+        f = root / "code.py"
+        f.write_text("query(input)\n")
+        raw = json.dumps([{
+            "line": 1, "code": "query(input)", "severity": "High",
+            "explanation": "e", "fix": "f",
+            "source": "argv[1]", "sink": "db.query",
+        }])
+        with patch.object(ss, "call_pi", return_value=("ok", raw)):
+            result = ss.scan_file(
+                f, ss.OWASP_SCANNERS["B3"], root, results, sessions,
+                "FILE: {filename}\n{file_content}",
+                prompt_hash_value="phash", timeout=60,
+            )
+        self.assertNotIn("unsubstantiated", result["result"][0].get("tags", []))
+        tmp.cleanup()
+
+
+class TestUnsubstantiatedInReportAndVerify(unittest.TestCase):
+    """Ticket 02: the tag shows up in the report and rides along in the
+    findings payload handed to the verifier."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.results_dir = self.state / "injection" / "results"
+        self.results_dir.mkdir(parents=True)
+        self.output = self.root / "report.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _seed(self, rel, vulns):
+        (self.results_dir / f"{rel.replace('/', '_')}.json").write_text(
+            json.dumps({
+                "file": rel, "scanner": "injection", "status": "ok",
+                "result": vulns, "content_hash": "abc",
+            })
+        )
+
+    def test_report_shows_unsubstantiated_tag(self):
+        self._seed("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": "", "tags": ["unsubstantiated"]},
+        ])
+        ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        text = self.output.read_text()
+        self.assertIn("unsubstantiated", text)
+
+    def test_report_counts_unsubstantiated_per_scanner(self):
+        self._seed("a.py", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": "", "tags": ["unsubstantiated"]},
+        ])
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        self.assertEqual(stats["unsubstantiated_count"], 1)
+
+    def test_verify_findings_payload_includes_tag(self):
+        """verify_finding serializes findings (tags included) into the prompt."""
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        verify_dir = root / "state" / "injection" / "verifications"
+        verify_dir.mkdir(parents=True)
+        sessions = root / "sessions"
+        sessions.mkdir()
+        f = root / "code.py"
+        f.write_text("query(input)\n")
+        findings = [{
+            "line": 1, "code": "q", "severity": "High",
+            "explanation": "", "fix": "", "tags": ["unsubstantiated"],
+        }]
+        captured = {}
+        def fake_call_pi(prompt, *a, **kw):
+            captured["prompt"] = prompt
+            return "ok", "[{\"line\":1,\"confidence\":\"High\",\"exploitable\":\"yes\",\"verification_reason\":\"r\"}]"
+        with patch.object(ss, "call_pi", side_effect=fake_call_pi):
+            ss.verify_finding(
+                f, ss.OWASP_SCANNERS["B3"], "code.py", findings, root,
+                verify_dir, sessions,
+                "FINDINGS: {findings_json}\nFILE: {filename}\n{file_content}",
+                "vphash", timeout=60,
+            )
+        self.assertIn("unsubstantiated", captured["prompt"])
+        tmp.cleanup()
+
+    def test_verify_prompt_mentions_unsubstantiated_tag(self):
+        text = ss.load_verify_prompt()
+        self.assertIn("unsubstantiated", text)
+
+
+class TestPromptHashInvalidatesScanCache(unittest.TestCase):
+    """Ticket 02: editing a scanner prompt forces a one-time re-scan."""
+
+    def test_prompt_hash_changes_on_template_edit(self):
+        h1 = ss.prompt_hash("template A")
+        h2 = ss.prompt_hash("template B with source/sink fields")
+        self.assertNotEqual(h1, h2)
+        a = ss.file_key("a.py", "injection", "chash", h1)
+        b = ss.file_key("a.py", "injection", "chash", h2)
+        self.assertNotEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
