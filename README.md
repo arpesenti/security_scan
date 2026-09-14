@@ -321,6 +321,7 @@ each is independently grep-able.
 | `--verify-thinking LEVEL` | `medium` | Reasoning effort for the verify phase. Per-finding judgment benefits from chain-of-thought. Cache key includes this value. |
 | `--max-file-size BYTES` | `1048576` (1 MiB) | Skip files larger than this during discovery, so they're also skipped in scan and verify (defensive re-check). The default catches auto-generated bundles, vendored minified JS, lockfiles, and generated protobufs while fitting comfortably in any modern model's context window. Set to `0` to disable the cap entirely. |
 | `--progress` / `--no-progress` | on | Show an in-place stderr progress line with per-phase counts and ETA. Use `--no-progress` for quiet CI logs. |
+| `--export-allowlist-candidates` | off | Export candidate suppression entries derived from Refuted Findings into `allowlist.json` (marked `status: candidate`). Candidates suppress nothing until a human flips status to `confirmed`. Idempotent on re-export. |
 
 ## Cache invalidation
 
@@ -431,11 +432,27 @@ Match semantics (first matching entry wins):
 - `scanner` — OWASP ID (`"B3"`) or `"*"` for any
 - `file` — exact relative path or `"*"` for any
 - `line` — line number; `0`/`null`/missing matches the whole file
+- `status` — `"confirmed"` (suppresses; also the default when the field is
+  absent, so pre-existing allowlists keep working) or `"candidate"`
+  (**suppresses nothing** until a human flips it to `confirmed`)
 
 Suppressed findings are **excluded from severity counts and from the Overall Risk calculation**,
 but they remain visible in a collapsed **Suppressed Findings** section at the bottom of the
 report (with your `reason`) so you can audit them later. To unsuppress a finding, remove its
 entry from the allowlist and re-run.
+
+### Exporting candidate suppressions from refuted findings
+
+Machine refutations are reported, never silently allowlisted (docs/adr/0001). To make the
+human-approval flow a glance instead of a chore, run with
+`--export-allowlist-candidates`: it appends one `status: candidate` entry per Refuted
+Finding (scanner, file, line, cited reason) to the allowlist file. Candidates **match
+nothing** — the refuted findings stay out of the main buckets either way — until you
+personally flip each candidate's status to `confirmed`, at which point it suppresses like
+any hand-written entry. Re-export is idempotent: a finding that already has a candidate or
+confirmed entry is never duplicated. The report's audit trail keeps the two apart: the
+**Suppressed Findings** section lists confirmed entries' matches, and a separate **Pending
+candidate suppressions** section lists still-candidate entries.
 
 ## Output report
 

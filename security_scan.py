@@ -1570,10 +1570,16 @@ def load_verification_for_file(
     findings: list[dict],
     verify_dir: Path,
     verify_prompt_hash_value: str,
+    thinking: str = "",
 ) -> dict[str, dict] | None:
     """Look up the verification result for a (scanner, file) pair and return
     the line-keyed verification map. Returns None when there is no usable
     verification (no file, signature mismatch = stale, or scan failed).
+
+    `thinking` must match the level the verify pass ran with (see
+    `run_verification`) — the cache key includes it, so a lookup at a
+    different level misses (the report builder passes the CLI's
+    --verify-thinking value).
 
     Used by `build_report` to overlay confidence/exploitability onto findings
     without having to re-run verification.
@@ -1583,6 +1589,7 @@ def load_verification_for_file(
     f_sig = findings_signature(findings)
     key = verify_file_key(
         rel, scanner_name, content_hash_value, f_sig, verify_prompt_hash_value,
+        thinking,
     )
     cache_file = verify_dir / f"{key}.json"
     if not cache_file.exists():
@@ -1919,6 +1926,11 @@ def load_allowlist(state_dir: Path) -> list[dict]:
         file:     relative file path or "*" for any
         line:     line number, or null/0 to match the whole file
         reason:   free-text justification (shown in the report)
+        status:   "confirmed" (suppresses; also the default for legacy
+                  entries without a status field) or "candidate" (suppresses
+                  NOTHING until a human flips it to confirmed — see
+                  docs/adr/0001: machine refutations are reported, never
+                  silently allowlisted)
     """
     path = state_dir / ALLOWLIST_FILENAME
     if not path.exists():
@@ -1953,11 +1965,92 @@ def suppression_match(scanner_id: str, rel: str, line: object, entry: dict) -> b
 
 
 def find_suppression(scanner_id: str, rel: str, line: object, allowlist: list[dict]) -> dict | None:
-    """Return the first matching suppression entry, or None."""
+    """Return the first matching suppression entry, or None.
+
+    Candidate entries (status == "candidate") match nothing: suppression is
+    human-confirmed only. A human approves a candidate by flipping its status
+    to "confirmed". Entries with no status field (pre-candidate allowlists)
+    suppress as before.
+    """
     for entry in allowlist:
+        if entry.get("status") == "candidate":
+            continue
         if suppression_match(scanner_id, rel, line, entry):
             return entry
     return None
+
+
+def export_allowlist_candidates(state_dir: Path, refuted_findings: list[dict]) -> int:
+    """Export *candidate* suppression entries derived from Refuted Findings
+    into <state_dir>/allowlist.json.
+
+    Each entry is marked `"status": "candidate"` and suppresses nothing until
+    a human flips it to `"confirmed"` — the ADR's rule that machine
+    refutations are reported, never silently allowlisted (docs/adr/0001).
+
+    Re-export is idempotent: a (scanner, file, line) that already has an
+    entry — candidate OR confirmed — is not duplicated. Existing entries are
+    preserved. Returns the number of candidates added.
+
+    `refuted_findings` is the `refuted_findings` list from `build_report` or
+    `build_csv_report` stats: dicts with scanner, file, line, severity, and
+    the cited refutation reason.
+    """
+    if not refuted_findings:
+        return 0
+    path = state_dir / ALLOWLIST_FILENAME
+    data: dict = {"version": 1, "suppressions": []}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text())
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[WARN] Allowlist unreadable ({e}); starting fresh", file=sys.stderr)
+            data = {"version": 1, "suppressions": []}
+    sups = data.get("suppressions")
+    if not isinstance(sups, list):
+        sups = []
+
+    existing = {
+        (s.get("scanner"), s.get("file"), s.get("line"))
+        for s in sups if isinstance(s, dict)
+    }
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    added = 0
+    for rf in refuted_findings:
+        if not isinstance(rf, dict):
+            continue
+        scanner = rf.get("scanner", "*")
+        file_rel = rf.get("file", "")
+        raw_line = rf.get("line")
+        try:
+            line = int(raw_line)
+        except (TypeError, ValueError):
+            line = 0  # match the whole file when no line is available
+        key = (scanner, file_rel, line)
+        if key in existing:
+            continue
+        sups.append({
+            "scanner": scanner,
+            "file": file_rel,
+            "line": line,
+            "reason": rf.get("reason") or "Refuted by the phase-3 verifier",
+            "status": "candidate",
+            "exported_at": now,
+        })
+        existing.add(key)
+        added += 1
+
+    if added == 0:
+        return 0
+    data["suppressions"] = sups
+    data.setdefault("version", 1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    shutil.move(str(tmp), str(path))
+    return added
 
 
 def max_severity_at_or_above(counts: dict[str, int], threshold: str) -> int:
@@ -1982,6 +2075,7 @@ def build_report(
     allowlist: list[dict] | None = None,
     confidence_threshold: str | None = None,
     phase_tools: dict[str, bool] | None = None,
+    verify_thinking: str = "",
 ) -> dict:
     """Read cached results for all scanners and produce a combined Markdown report.
 
@@ -2169,6 +2263,7 @@ def build_report(
                 verifications = load_verification_for_file(
                     scanner_name, rel, c_hash, vulns,
                     scanner_verify_dir, verify_prompt_hash_value,
+                    verify_thinking,
                 ) or {}
 
             # Refutation-first bucketing: every non-suppressed finding lands
@@ -2464,7 +2559,8 @@ def build_report(
         w()
         w("<details><summary>Toggle suppressed findings</summary>")
         w()
-        w("These findings matched an entry in `.security_scan/allowlist.json` and")
+        w("These findings matched a **confirmed** entry in "
+          "`.security_scan/allowlist.json` and")
         w("are excluded from severity counts and the Overall Risk calculation.")
         w("They remain visible here for auditability.")
         w()
@@ -2475,6 +2571,24 @@ def build_report(
             w(f"- `{sf['scanner']}` `{sf['file']}:{line_num}` — `{severity}` — {sf['reason']}")
         w()
         w("</details>")
+        w()
+
+    # Audit trail for candidate suppressions (Ticket 05): candidates are
+    # machine-exported entries that match nothing until a human flips their
+    # status to confirmed. Listed separately from confirmed suppressions so
+    # the audit trail never conflates the two.
+    candidate_entries = [e for e in allowlist if isinstance(e, dict) and e.get("status") == "candidate"]
+    if candidate_entries:
+        w("### Pending candidate suppressions")
+        w()
+        w("These `status: candidate` entries in `.security_scan/allowlist.json` "
+          "were exported from machine refutations. They **suppress nothing** "
+          "until you approve each one by flipping its status to "
+          "`confirmed`. They are NOT counted in the Suppressed Findings "
+          "section above.")
+        w()
+        for ce in candidate_entries:
+            w(f"- `{ce.get('scanner', '*')}` `{ce.get('file', '*')}:{ce.get('line', 0)}` — {ce.get('reason', '(no reason)')}")
         w()
 
     if refuted_findings_global:
@@ -2712,6 +2826,7 @@ def build_csv_report(
     confidence_threshold: str | None = None,
     delimiter: str = ",",
     phase_tools: dict[str, bool] | None = None,
+    verify_thinking: str = "",
 ) -> dict:
     """Produce a CSV/TSV report with one row per finding, suitable for
     importing into a spreadsheet. Mirrors `build_report`'s allowlist and
@@ -2857,6 +2972,7 @@ def build_csv_report(
                 verifications = load_verification_for_file(
                     scanner_name, rel, c_hash, vulns,
                     verify_dir, verify_prompt_hash_value,
+                    verify_thinking,
                 ) or {}
 
             for v in vulns:
@@ -3176,10 +3292,21 @@ OWASP 2025 Categories:
         default="md",
         help="Output format for the report. 'md' (default) writes the human-"
              "readable markdown report. 'csv' and 'tsv' write one row per "
-             "finding (active, needs_review, and suppressed) for spreadsheet "
-             "import; the file extension on --output is auto-adjusted to "
-             "match. Both formats apply the same allowlist and verification "
-             "overlays and the same --fail-on / --fail-on-confidence gates.",
+             "finding (active, needs_review, refuted, not_actionable, and "
+             "suppressed) for spreadsheet import; the file extension on "
+             "--output is auto-adjusted to match. Both formats apply the "
+             "same allowlist and verification overlays and the same --fail-on "
+             "/ --fail-on-confidence gates.",
+    )
+    parser.add_argument(
+        "--export-allowlist-candidates",
+        action="store_true",
+        help="Export candidate suppression entries derived from Refuted "
+             "Findings into .security_scan/allowlist.json. Each entry is "
+             "marked status=candidate and suppresses NOTHING until a human "
+             "flips it to confirmed (suppression is human-confirmed only). "
+             "Re-export is idempotent: existing candidate or confirmed "
+             "entries are never duplicated.",
     )
 
     args = parser.parse_args()
@@ -3397,6 +3524,7 @@ OWASP 2025 Categories:
                     state_dir, output_path, repo_root, scanner_ids, discovery_map,
                     allowlist, confidence_threshold=confidence_threshold,
                     phase_tools=phase_tools,
+                            verify_thinking=args.verify_thinking,
                 )
             else:
                 delimiter = "\t" if args.report_format == "tsv" else ","
@@ -3405,7 +3533,44 @@ OWASP 2025 Categories:
                     allowlist, confidence_threshold=confidence_threshold,
                     delimiter=delimiter,
                     phase_tools=phase_tools,
+                            verify_thinking=args.verify_thinking,
                 )
+
+            # Ticket 05: turn the human-approval flow into a glance. Export
+            # candidate suppression entries derived from Refuted Findings;
+            # candidates match nothing until a human flips status to
+            # confirmed. When new candidates were written, rebuild the report
+            # so the audit trail separates confirmed suppressions from the
+            # pending candidates (a pure cache read — no model calls).
+            if args.export_allowlist_candidates:
+                refuted = stats.get("refuted_findings") or []
+                added = export_allowlist_candidates(state_dir, refuted)
+                if added:
+                    print(f"  Exported {added} candidate suppression(s) to "
+                          f"{state_dir / ALLOWLIST_FILENAME} (status=candidate; "
+                          "suppresses nothing until confirmed)")
+                    allowlist = load_allowlist(state_dir)
+                    if args.report_format == "md":
+                        stats = build_report(
+                            state_dir, output_path, repo_root, scanner_ids,
+                            discovery_map, allowlist,
+                            confidence_threshold=confidence_threshold,
+                            phase_tools=phase_tools,
+                            verify_thinking=args.verify_thinking,
+                        )
+                    else:
+                        delimiter = "\t" if args.report_format == "tsv" else ","
+                        stats = build_csv_report(
+                            state_dir, output_path, repo_root, scanner_ids,
+                            discovery_map, allowlist,
+                            confidence_threshold=confidence_threshold,
+                            delimiter=delimiter,
+                            phase_tools=phase_tools,
+                            verify_thinking=args.verify_thinking,
+                        )
+                else:
+                    print("  Candidate export: nothing new to export "
+                          "(--export-allowlist-candidates is idempotent)")
     
             # Exit-code logic for CI integration.
             #

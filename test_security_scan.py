@@ -1142,6 +1142,40 @@ class TestBuildReportWithVerification(unittest.TestCase):
             "verify_prompt_hash": vph, "content_hash": c_hash,
         }))
 
+    def test_report_lookup_matches_verify_cache_thinking_key(self):
+        """Regression: the real verify pass writes its cache keyed on
+        --verify-thinking (default 'medium'), so the report's lookup must use
+        the same thinking level or verdicts never overlay."""
+        vulns = [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ]
+        self._write_scan_result("a.py", vulns)
+        # Seed the verification the way the REAL pipeline writes it:
+        # verify_finding runs with thinking='medium'.
+        vph = ss.prompt_hash(ss.load_verify_prompt())
+        f_sig = ss.findings_signature(vulns)
+        key = ss.verify_file_key("a.py", "injection", "testhash", f_sig, vph, "medium")
+        (self.verify_dir / f"{key}.json").write_text(json.dumps({
+            "file": "a.py", "scanner": "injection", "status": "ok",
+            "verifications": {
+                "1": {"verdict": "confirmed", "confidence": "High",
+                      "exploitable": "yes",
+                      "verification_reason": "reachable from main"},
+            },
+            "findings_signature": f_sig,
+            "verify_prompt_hash": vph, "content_hash": "testhash",
+        }))
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+            verify_thinking="medium",
+        )
+        self.assertEqual(stats["confidence_counts"]["High"], 1)
+        self.assertEqual(stats["unverified_count"], 0)
+        text = self.output.read_text()
+        self.assertIn("reachable from main", text)
+
     def test_unverified_findings_marked_unverified(self):
         vulns = [
             {"line": 1, "severity": "High", "code": "x",
@@ -3698,6 +3732,196 @@ class TestRefutationBuckets(unittest.TestCase):
         self.assertEqual(entry["file"], "a.py")
         self.assertEqual(entry["line"], 2)
         self.assertIn("parameterized", entry["reason"])
+
+
+# ── Ticket 05: Export allowlist candidates from refuted findings ───────────
+
+
+class TestCandidateSuppressions(unittest.TestCase):
+    """Ticket 05: candidate suppression entries derived from refuted findings.
+    Suppression stays human-confirmed only: a candidate entry matches nothing
+    until a person flips its status to confirmed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _refuted(self, **over):
+        entry = {
+            "scanner": "B3", "file": "a.py", "line": 42,
+            "severity": "High",
+            "reason": "refuted: parameterized by QueryBuilder (db/qb.py:42)",
+        }
+        entry.update(over)
+        return entry
+
+    def test_export_writes_candidate_entries(self):
+        added = ss.export_allowlist_candidates(
+            self.state, [self._refuted()],
+        )
+        self.assertEqual(added, 1)
+        data = json.loads((self.state / "allowlist.json").read_text())
+        sups = data["suppressions"]
+        self.assertEqual(len(sups), 1)
+        self.assertEqual(sups[0]["scanner"], "B3")
+        self.assertEqual(sups[0]["file"], "a.py")
+        self.assertEqual(sups[0]["line"], 42)
+        self.assertEqual(sups[0]["status"], "candidate")
+        self.assertIn("parameterized", sups[0]["reason"])
+
+    def test_export_never_creates_file_when_no_refuted(self):
+        added = ss.export_allowlist_candidates(self.state, [])
+        self.assertEqual(added, 0)
+        self.assertFalse((self.state / "allowlist.json").exists())
+
+    def test_export_preserves_existing_entries(self):
+        (self.state / "allowlist.json").write_text(json.dumps({
+            "version": 1,
+            "suppressions": [
+                {"scanner": "B5", "file": "cfg.yml", "line": 3,
+                 "reason": "human-confirmed FP"},
+            ],
+        }))
+        ss.export_allowlist_candidates(self.state, [self._refuted()])
+        data = json.loads((self.state / "allowlist.json").read_text())
+        self.assertEqual(len(data["suppressions"]), 2)
+        self.assertEqual(data["suppressions"][0]["reason"], "human-confirmed FP")
+
+    def test_export_is_idempotent(self):
+        refuted = [self._refuted()]
+        first = ss.export_allowlist_candidates(self.state, refuted)
+        second = ss.export_allowlist_candidates(self.state, refuted)
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
+        data = json.loads((self.state / "allowlist.json").read_text())
+        self.assertEqual(len(data["suppressions"]), 1)
+
+    def test_export_skips_already_confirmed_entry(self):
+        """A human already confirmed a suppression for this finding — don't
+        duplicate it as a candidate."""
+        (self.state / "allowlist.json").write_text(json.dumps({
+            "version": 1,
+            "suppressions": [
+                {"scanner": "B3", "file": "a.py", "line": 42,
+                 "reason": "already confirmed", "status": "confirmed"},
+            ],
+        }))
+        added = ss.export_allowlist_candidates(self.state, [self._refuted()])
+        self.assertEqual(added, 0)
+
+    def test_candidate_matches_nothing(self):
+        """The core rule: candidate entries suppress nothing until approved."""
+        allowlist = [
+            {"scanner": "B3", "file": "a.py", "line": 42,
+             "reason": "machine-refuted", "status": "candidate"},
+        ]
+        self.assertIsNone(ss.find_suppression("B3", "a.py", 42, allowlist))
+
+    def test_confirmed_entry_still_matches(self):
+        allowlist = [
+            {"scanner": "B3", "file": "a.py", "line": 42,
+             "reason": "approved", "status": "confirmed"},
+        ]
+        self.assertIsNotNone(ss.find_suppression("B3", "a.py", 42, allowlist))
+
+    def test_missing_status_treated_as_confirmed(self):
+        """Backward compat: allowlists written before the status field existed
+        suppress as before."""
+        allowlist = [
+            {"scanner": "B3", "file": "a.py", "line": 42, "reason": "old entry"},
+        ]
+        self.assertIsNotNone(ss.find_suppression("B3", "a.py", 42, allowlist))
+
+    def test_candidate_status_flip_activates_suppression(self):
+        """The human-approval flow: flip status to confirmed and the entry
+        starts suppressing."""
+        ss.export_allowlist_candidates(self.state, [self._refuted()])
+        path = self.state / "allowlist.json"
+        data = json.loads(path.read_text())
+        data["suppressions"][0]["status"] = "confirmed"
+        path.write_text(json.dumps(data))
+        allowlist = ss.load_allowlist(self.state)
+        self.assertIsNotNone(ss.find_suppression("B3", "a.py", 42, allowlist))
+
+    def test_report_separates_confirmed_from_candidates(self):
+        """The audit trail shows confirmed suppressions and pending candidates
+        as distinct things."""
+        state = self.state
+        rd = state / "injection" / "results"
+        rd.mkdir(parents=True)
+        (rd / "a_py.json").write_text(json.dumps({
+            "file": "a.py", "scanner": "injection", "status": "ok",
+            "result": [
+                {"line": 1, "severity": "High", "code": "x",
+                 "explanation": "", "fix": ""},
+                {"line": 2, "severity": "High", "code": "y",
+                 "explanation": "", "fix": ""},
+            ],
+            "content_hash": "abc",
+        }))
+        vd = state / "injection" / "verifications"
+        vd.mkdir()
+        vulns = [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+            {"line": 2, "severity": "High", "code": "y",
+             "explanation": "", "fix": ""},
+        ]
+        vph = ss.prompt_hash(ss.load_verify_prompt())
+        f_sig = ss.findings_signature(vulns)
+        key = ss.verify_file_key("a.py", "injection", "abc", f_sig, vph)
+        (vd / f"{key}.json").write_text(json.dumps({
+            "file": "a.py", "scanner": "injection", "status": "ok",
+            "verifications": {
+                "1": {"verdict": "confirmed", "confidence": "High",
+                      "exploitable": "yes", "verification_reason": "r"},
+                "2": {"verdict": "refuted", "confidence": "High",
+                      "exploitable": "no", "verification_reason": "refuted: safe"},
+            },
+            "findings_signature": f_sig,
+            "verify_prompt_hash": vph, "content_hash": "abc",
+        }))
+        allowlist = [
+            {"scanner": "B3", "file": "a.py", "line": 1,
+             "reason": "human-confirmed FP", "status": "confirmed"},
+        ]
+        (state / "allowlist.json").write_text(json.dumps(
+            {"version": 1, "suppressions": allowlist}))
+        stats = ss.build_report(
+            state, self.state / "report.md", self.state, ["B3"],
+            {"B3": [".py"]}, allowlist=list(allowlist),
+        )
+        # One refuted finding available for export
+        self.assertEqual(len(stats["refuted_findings"]), 1)
+        # Export it, reload, rebuild, and check the audit trail
+        added = ss.export_allowlist_candidates(state, stats["refuted_findings"])
+        self.assertEqual(added, 1)
+        allowlist = ss.load_allowlist(state)
+        ss.build_report(
+            state, self.state / "report.md", self.state, ["B3"],
+            {"B3": [".py"]}, allowlist=allowlist,
+        )
+        text = (self.state / "report.md").read_text()
+        self.assertIn("human-confirmed FP", text)
+        self.assertIn("Pending candidate suppressions", text)
+        self.assertIn("refuted: safe", text)
+        # The candidate suppresses nothing: the refuted finding stays in the
+        # Refuted section on the next run too.
+        self.assertIn("Refuted Findings", text)
+        self.assertEqual(stats["refuted_count"], 1)
+
+    def test_main_flag_wires_export(self):
+        """--export-allowlist-candidates is a recognized CLI flag."""
+        proc = subprocess.run(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "security_scan.py"),
+             "--help"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertIn("--export-allowlist-candidates", proc.stdout)
 
 
 if __name__ == "__main__":
