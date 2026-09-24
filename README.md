@@ -580,11 +580,21 @@ pipeline can't silently pass. Combine the two flags in CI scripts:
 Out of the box the walker skips:
 
 - **Directories**: `.git`, `.svn`, `.idea`, `.vscode`, `node_modules`, `vendor`, `build`,
-  `dist`, `.venv`, `__pycache__`, `.security_scan`, `ThirdParty/wheelhouse`, `Source/Regression`
-  (and everything beneath them)
+  `dist`, `.venv`, `__pycache__`, `ThirdParty/wheelhouse`, `Source/Regression` (and everything
+  beneath them). Also, at **any depth**, any directory whose name starts with `.security_scan`
+  — the state dir and renamed/backed-up copies (`.security_scan_old`, `.security_scan.bak`, …)
+  are never scanned as source.
 - **Files**: `security_scan.py`, `security_report.md`, `sqli_scan.py`, `sqli_report.md`
 - **Binary extensions** (`.png`, `.jar`, `.class`, `.dylib`, `.whl`, …) and any file whose
   first 8 KB contains a NUL byte
+
+The excludes are re-applied when verification plans its work and when the report is built, so
+stale scan results for a path that is excluded now (e.g. a state dir that was renamed after
+being scanned) are dropped instead of being re-verified forever or listed in the report.
+
+Two caveats: exclude entries other than `.security_scan*` match a top-level name or a full
+relative path prefix — a `vendor/` nested deep in the tree is not pruned. And the lists are
+hard-coded; there is no per-run `--exclude` flag.
 
 To change the lists, edit the `EXCLUDE_DIRS`, `EXCLUDE_FILES`, and `BINARY_EXTS` sets at the
 top of `security_scan.py`.

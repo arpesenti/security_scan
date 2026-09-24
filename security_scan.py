@@ -141,6 +141,50 @@ EXCLUDE_DIRS = {
     "Source/Regression",
 }
 EXCLUDE_FILES = {"security_scan.py", "security_report.md", "sqli_scan.py", "sqli_report.md"}
+
+# Directories created by the tool itself are matched by *name prefix* at any
+# depth, so renamed or backed-up state dirs (`.security_scan_old`,
+# `.security_scan.bak`, ...) are never scanned as source. Without this, a
+# renamed state dir gets scanned, its cache JSONs produce findings, and the
+# verify phase then spends days re-verifying its own cache files.
+STATE_DIR_PREFIX = ".security_scan"
+
+
+def is_excluded_dir(rel_dir: str, name: str) -> bool:
+    """True when a directory is covered by the global excludes.
+
+    `rel_dir` is the directory's repo-relative path and `name` its basename.
+    Entries in `EXCLUDE_DIRS` match a top-level name or a full relative path
+    prefix (`ThirdParty/wheelhouse`); the state dir matches by name prefix
+    anywhere.
+    """
+    if name.startswith(STATE_DIR_PREFIX):
+        return True
+    return any(
+        rel_dir == excl or rel_dir.startswith(excl + "/") for excl in EXCLUDE_DIRS
+    )
+
+
+def is_excluded_rel_path(rel: str) -> bool:
+    """True when a repo-relative *file* path is covered by the global excludes.
+
+    Mirrors what `find_all_files` would do with the path: an excluded
+    ancestor directory prunes everything beneath it, and `EXCLUDE_FILES`
+    matches by basename at any depth. Used by the verify pre-check and the
+    report builders so stale scan results for paths that are excluded now
+    (e.g. a renamed state dir) are not re-verified or reported.
+    """
+    parts = [p for p in Path(rel).parts if p not in (".", "")]
+    if not parts:
+        return False
+    if parts[-1] in EXCLUDE_FILES:
+        return True
+    for i in range(len(parts) - 1):
+        if is_excluded_dir("/".join(parts[: i + 1]), parts[i]):
+            return True
+    return False
+
+
 BINARY_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
     ".ttf", ".eot", ".pdf", ".bin", ".gz", ".wav", ".class", ".jar", ".whl",
@@ -196,7 +240,7 @@ def find_all_files(
         pruned = []
         for d in dirnames:
             rel = f"{rel_dir}/{d}" if rel_dir != "." else d
-            if any(rel == excl or rel.startswith(excl + "/") for excl in EXCLUDE_DIRS):
+            if is_excluded_dir(rel, d):
                 continue
             pruned.append(d)
         dirnames[:] = pruned
@@ -1214,7 +1258,7 @@ def build_repo_structure(root: Path, ext_map: dict[str, list[Path]], name_map: d
         pruned = []
         for d in dirnames:
             rel_d = f"{rel_dir_str}/{d}" if rel_dir_str != "." else d
-            if any(rel_d == excl or rel_d.startswith(excl + "/") for excl in EXCLUDE_DIRS):
+            if is_excluded_dir(rel_d, d):
                 continue
             pruned.append(d)
         dirnames[:] = pruned
@@ -1662,6 +1706,7 @@ def plan_verification(
 
     files_to_verify: list[tuple[Path, str, Path]] = []
     cached_count = 0
+    excluded_count = 0
     if not results_dir.exists():
         return {
             "scanner_cfg": scanner_cfg,
@@ -1685,6 +1730,11 @@ def plan_verification(
             continue
         rel = data.get("file", "")
         if not rel:
+            continue
+        if is_excluded_rel_path(rel):
+            # Stale result for a path the walker no longer scans (e.g. a
+            # renamed state dir): never worth a model call.
+            excluded_count += 1
             continue
         result = data.get("result", [])
         if not isinstance(result, list):
@@ -1744,6 +1794,13 @@ def plan_verification(
                 pass
 
         files_to_verify.append((filepath, rel, rf))
+
+    if excluded_count:
+        print(
+            f"[VERIFY-SKIP] [{scanner_cfg['name']}] {excluded_count} result(s) "
+            f"for excluded paths (stale results; see EXCLUDE_DIRS)",
+            file=sys.stderr,
+        )
 
     return {
         "scanner_cfg": scanner_cfg,
@@ -2571,6 +2628,10 @@ def build_report(
                 continue
 
             rel = data.get("file", "unknown")
+            if is_excluded_rel_path(rel):
+                # Stale result for a path the walker now excludes (e.g. a
+                # renamed state dir): keep it out of the report.
+                continue
             result_raw = data.get("result", {})
             status = data.get("status", "unknown")
             c_hash = data.get("content_hash", "")
@@ -3290,6 +3351,10 @@ def build_csv_report(
                 continue
 
             rel = data.get("file", "unknown")
+            if is_excluded_rel_path(rel):
+                # Stale result for a path the walker now excludes (e.g. a
+                # renamed state dir): keep it out of the report.
+                continue
             result_raw = data.get("result", {})
             status = data.get("status", "unknown")
             c_hash = data.get("content_hash", "")

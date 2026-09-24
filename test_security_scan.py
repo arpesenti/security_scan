@@ -139,6 +139,21 @@ class TestFindAllFiles(unittest.TestCase):
         self.assertNotIn("security_scan.py", rels)
         self.assertIn("app.py", rels)
 
+    def test_excludes_state_dir_renames_by_prefix(self):
+        # A renamed/backed-up state dir must never be scanned as source:
+        # its cache JSONs would otherwise be queued for verification.
+        self._touch(".security_scan_old/access_control/results/x.json", "{}")
+        self._touch(".security_scan.bak/injection/results/y.json", "{}")
+        self._touch("sub/.security_scan_old/results/z.json", "{}")
+        # A *file* whose name merely starts with the prefix is not a state dir.
+        self._touch("src/.security_scanning.py")
+        all_files, _, _ = ss.find_all_files(self.root)
+        rels = [str(f.relative_to(self.root)) for f in all_files]
+        self.assertNotIn(".security_scan_old/access_control/results/x.json", rels)
+        self.assertNotIn(".security_scan.bak/injection/results/y.json", rels)
+        self.assertNotIn("sub/.security_scan_old/results/z.json", rels)
+        self.assertIn("src/.security_scanning.py", rels)
+
     def test_skips_binary_extensions(self):
         self._touch("image.png", "fake")
         self._touch("code.py")
@@ -662,6 +677,31 @@ class TestDiscoveryPrompt(unittest.TestCase):
         self.assertIn("{repo_structure}", prompt)
 
 
+class TestExcludedPaths(unittest.TestCase):
+    """is_excluded_rel_path mirrors what find_all_files would prune, so the
+    verify pre-check and report builders can drop stale results for paths
+    that are excluded now (e.g. a renamed state dir)."""
+
+    def test_state_dir_prefix_at_any_depth(self):
+        self.assertTrue(ss.is_excluded_rel_path(".security_scan/x.json"))
+        self.assertTrue(
+            ss.is_excluded_rel_path(".security_scan_old/access_control/results/x.json")
+        )
+        self.assertTrue(ss.is_excluded_rel_path("sub/.security_scan.bak/x.json"))
+        # Not a state dir: the prefix rule only applies to directories.
+        self.assertFalse(ss.is_excluded_rel_path("src/.security_scanning.json"))
+
+    def test_exclude_dirs_and_files(self):
+        self.assertTrue(ss.is_excluded_rel_path("node_modules/pkg/index.js"))
+        self.assertTrue(ss.is_excluded_rel_path("Source/Regression/a.py"))
+        self.assertTrue(ss.is_excluded_rel_path("ThirdParty/wheelhouse/nested/b.py"))
+        self.assertTrue(ss.is_excluded_rel_path("security_scan.py"))
+        self.assertTrue(ss.is_excluded_rel_path("deep/dir/security_scan.py"))
+        self.assertFalse(ss.is_excluded_rel_path("src/app.py"))
+        self.assertFalse(ss.is_excluded_rel_path("Source/RegressionX/a.py"))
+        self.assertFalse(ss.is_excluded_rel_path("unknown"))
+
+
 class TestBuildReport(unittest.TestCase):
     """Integration test: build a report from cached results + allowlist."""
 
@@ -687,6 +727,23 @@ class TestBuildReport(unittest.TestCase):
         if extra:
             data.update(extra)
         (rd / f"{rel.replace('/', '_')}.json").write_text(json.dumps(data))
+
+    def test_excluded_stale_results_dropped_from_report(self):
+        """A stale result for a path the walker now excludes (renamed state
+        dir) must not appear in the report or its severity counts."""
+        self._write_result("B3", "a.py", [
+            {"line": 1, "severity": "High", "code": "x", "explanation": "", "fix": ""},
+        ])
+        self._write_result("B3", ".security_scan_old/results/x.json", [
+            {"line": 1, "severity": "Critical", "code": "y", "explanation": "", "fix": ""},
+        ])
+        stats = ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, [],
+        )
+        self.assertEqual(stats["severity_counts"]["High"], 1)
+        self.assertEqual(stats["severity_counts"]["Critical"], 0)
+        self.assertNotIn(".security_scan_old", self.output.read_text())
 
     def test_active_vs_suppressed_counts(self):
         self._write_result("B3", "a.py", [
@@ -3052,6 +3109,23 @@ class TestVerifyCachePreCheck(unittest.TestCase):
             self.cfg, self.root, self.state, reverify=False,
         )
         self.assertEqual(plan["files_to_verify"], [])
+        self.assertEqual(plan["cached_count"], 0)
+
+    def test_plan_verification_skips_excluded_paths(self):
+        """A stale result for a path the walker excludes (renamed state
+        dir) must not enter the verify queue."""
+        vulns = [{"line": 1, "severity": "High", "code": "x",
+                  "explanation": "", "fix": ""}]
+        stale = self.root / ".security_scan_old" / "results" / "x.json"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("{}")
+        self._write_scan_result(".security_scan_old/results/x.json", vulns)
+        with patch("builtins.print"):
+            plan = ss.plan_verification(
+                self.cfg, self.root, self.state, reverify=False,
+            )
+        self.assertEqual(plan["files_to_verify"], [])
+        # Not counted as a cache hit either: it is simply not work.
         self.assertEqual(plan["cached_count"], 0)
 
     def test_plan_verification_skips_oversized_files(self):
