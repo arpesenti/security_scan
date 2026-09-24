@@ -2543,6 +2543,124 @@ class TestProgressTrackerBasic(unittest.TestCase):
             self.assertIn("1/2", out)
 
 
+class TestProgressTrackerGroups(unittest.TestCase):
+    """Grouped phases accumulate counters across batches (instead of
+    resetting per scanner) and add an `[overall]` ETA for the whole run."""
+
+    def setUp(self):
+        self._stderr_patch = patch.object(ss.sys, "stderr", new=_io.StringIO())
+        self._stderr_patch.start()
+
+    def tearDown(self):
+        self._stderr_patch.stop()
+
+    def _render(self, p):
+        with patch.object(p, "_use_cr", False), \
+             patch.object(p, "_ensure_render_thread"):
+            p._render()
+        return ss.sys.stderr.getvalue()
+
+    def test_group_counters_accumulate_across_batches(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_ensure_render_thread"):
+            p.plan_phase("verify", 2)
+            p.start_group("verify", "access_control", 10, index=1)
+            for _ in range(4):
+                p.tick("verify")
+            p.start_group("verify", "injection", 5, index=2)
+            p.tick("verify")
+        with p._lock:
+            entry = p._phases["verify"]
+            self.assertEqual(entry["total"], 15)
+            self.assertEqual(entry["completed"], 5)
+
+    def test_grouped_render_shows_batch_and_cumulative_count(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_ensure_render_thread"):
+            p.plan_phase("verify", 3)
+            p.start_group("verify", "access_control", 10, index=1)
+            for _ in range(3):
+                p.tick("verify")
+            p.start_group("verify", "injection", 5, index=2)
+            p.tick("verify")
+        out = self._render(p)
+        self.assertIn("[verify 2/3 injection] 4/15", out)
+
+    def test_overall_eta_is_lower_bound_until_all_batches_start(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_ensure_render_thread"):
+            p.plan_phase("verify", 3)
+            p.start_group("verify", "access_control", 10, index=1)
+            for _ in range(2):
+                p.tick("verify")
+        out = self._render(p)
+        self.assertIn("[overall] ETA ≥", out)
+
+    def test_overall_eta_is_exact_when_all_batches_started(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_ensure_render_thread"):
+            p.plan_phase("verify", 2)
+            p.start_group("verify", "access_control", 10, index=1)
+            for _ in range(2):
+                p.tick("verify")
+            p.start_group("verify", "injection", 5, index=2)
+        out = self._render(p)
+        self.assertIn("[overall] ETA ", out)
+        self.assertNotIn("≥", out)
+
+    def test_zero_total_batch_completes_the_plan(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_ensure_render_thread"):
+            p.plan_phase("scan", 2)
+            p.start_group("scan", "injection", 5, index=1)
+            for _ in range(5):
+                p.tick("scan")
+            p.start_group("scan", "crypto", 0, index=2)  # fully cached batch
+        out = self._render(p)
+        self.assertIn("[scan 2/2 crypto] 5/5 (done)", out)
+        self.assertNotIn("≥", out)
+
+    def test_planned_batches_make_overall_eta_exact(self):
+        """When every batch total is known up front (plan_group), the
+        overall ETA is exact even though later batches haven't started."""
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_ensure_render_thread"):
+            p.plan_phase("verify", 2)
+            p.plan_group("verify", "access_control", 10, index=1)
+            p.plan_group("verify", "injection", 5, index=2)
+            p.start_group("verify", "access_control", 10, index=1)
+            for _ in range(2):
+                p.tick("verify")
+        out = self._render(p)
+        self.assertIn("[verify 1/2 access_control] 2/15", out)
+        self.assertIn("[overall] ETA ", out)
+        self.assertNotIn("≥", out)
+
+    def test_planned_but_unstarted_batch_never_shows_done(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_ensure_render_thread"):
+            p.plan_phase("verify", 2)
+            p.plan_group("verify", "access_control", 5, index=1)
+            p.plan_group("verify", "injection", 0, index=2)
+            p.start_group("verify", "access_control", 5, index=1)
+            for _ in range(5):
+                p.tick("verify")
+            out_before = self._render(p)
+            # Batch 1 is done, but planned batch 2 hasn't started.
+            self.assertNotIn("(done)", out_before)
+            p.start_group("verify", "injection", 0, index=2)
+            out_after = self._render(p)
+        self.assertIn("[verify 2/2 injection] 5/5 (done)", out_after)
+
+    def test_flat_phase_has_no_overall_segment(self):
+        p = ss.ProgressTracker(enabled=True)
+        with patch.object(p, "_ensure_render_thread"):
+            p.start_phase("scan", 10)
+        out = self._render(p)
+        self.assertIn("[scan] 0/10", out)
+        self.assertNotIn("[overall]", out)
+
+
 class TestFormatEta(unittest.TestCase):
     def test_seconds_under_minute(self):
         self.assertEqual(ss._format_eta(-1), "?")
@@ -2558,6 +2676,10 @@ class TestFormatEta(unittest.TestCase):
         self.assertEqual(ss._format_eta(3600), "1h00m")
         self.assertEqual(ss._format_eta(3660), "1h01m")
         self.assertEqual(ss._format_eta(7325), "2h02m")
+
+    def test_days(self):
+        self.assertEqual(ss._format_eta(86400), "1d00h")
+        self.assertEqual(ss._format_eta(90000), "1d01h")
 
     def test_infinity(self):
         self.assertEqual(ss._format_eta(float("inf")), "?")
@@ -2633,6 +2755,70 @@ class TestProgressIntegration(unittest.TestCase):
             self.assertIsNotNone(entry)
             self.assertEqual(entry["total"], 1)
             self.assertEqual(entry["completed"], 1)
+
+    def test_run_scanner_reports_grouped_batch(self):
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(ss, "call_pi", return_value=("ok", "[]")), \
+             patch.object(tracker, "_ensure_render_thread"):
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                progress=tracker, scanner_index=1,
+            )
+        with tracker._lock:
+            entry = tracker._phases["scan"]
+            self.assertEqual(entry["total"], 1)
+            self.assertEqual(entry["completed"], 1)
+            self.assertIn("injection", entry["groups"])
+
+    def test_run_scanner_registers_empty_batch_when_fully_cached(self):
+        all_files, ext_map, name_map = ss.find_all_files(self.root)
+        # Seed a valid scan-cache entry for thinking="off" (run_scanner's
+        # default) so the pending list comes out empty.
+        c_hash = ss.content_hash((self.root / "code.py").read_bytes())
+        key = ss.file_key("code.py", "injection", c_hash, self.p_hash, "off")
+        d = self.state / "injection" / "results"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{key}.json").write_text(json.dumps({
+            "file": "code.py", "scanner": "injection", "status": "ok",
+            "result": [], "content_hash": c_hash, "prompt_hash": self.p_hash,
+        }))
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(tracker, "_ensure_render_thread"):
+            ss.run_scanner(
+                "B3", self.cfg, ext_map, name_map, self.discovery,
+                self.root, self.state, self.sessions,
+                concurrency=1, max_files=0, rescan=False, dry_run=False,
+                progress=tracker, scanner_index=2,
+            )
+        with tracker._lock:
+            entry = tracker._phases["scan"]
+            self.assertEqual(entry["total"], 0)
+            self.assertEqual(entry["groups"]["injection"]["total"], 0)
+
+    def test_run_verification_reports_grouped_batch(self):
+        self._seed_scan_cache("results", [
+            {"line": 1, "severity": "High", "code": "x",
+             "explanation": "", "fix": ""},
+        ])
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+            {"line": 1, "confidence": "High", "exploitable": "yes",
+             "verification_reason": "ok"},
+        ]))), \
+             patch.object(tracker, "_ensure_render_thread"):
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                progress=tracker, scanner_index=1,
+            )
+        with tracker._lock:
+            entry = tracker._phases["verify"]
+            self.assertEqual(entry["total"], 1)
+            self.assertEqual(entry["completed"], 1)
+            self.assertIn("injection", entry["groups"])
 
     def test_run_scanner_skips_progress_when_none(self):
         all_files, ext_map, name_map = ss.find_all_files(self.root)
@@ -2842,6 +3028,71 @@ class TestVerifyCachePreCheck(unittest.TestCase):
         # The verify phase was never started in the tracker
         with tracker._lock:
             self.assertNotIn("verify", tracker._phases)
+
+    def test_plan_verification_excludes_cached_and_returns_result_paths(self):
+        vulns = [{"line": 1, "severity": "High", "code": "x",
+                  "explanation": "", "fix": ""}]
+        for rel, cached in [("a.py", False), ("b.py", True)]:
+            self._write_scan_result(rel, vulns)
+            if cached:
+                self._write_verification_cache(rel, vulns)
+        plan = ss.plan_verification(
+            self.cfg, self.root, self.state, reverify=False,
+        )
+        self.assertEqual([rel for _, rel, _ in plan["files_to_verify"]], ["a.py"])
+        self.assertEqual(plan["cached_count"], 1)
+        # The plan carries the scan-result path, not parsed findings, so
+        # planning all scanners up front doesn't hold every finding list.
+        _, _, result_file = plan["files_to_verify"][0]
+        self.assertTrue(result_file.exists())
+        self.assertEqual(result_file.parent.name, "results")
+
+    def test_plan_verification_handles_missing_results_dir(self):
+        plan = ss.plan_verification(
+            self.cfg, self.root, self.state, reverify=False,
+        )
+        self.assertEqual(plan["files_to_verify"], [])
+        self.assertEqual(plan["cached_count"], 0)
+
+    def test_plan_verification_skips_oversized_files(self):
+        vulns = [{"line": 1, "severity": "High", "code": "x",
+                  "explanation": "", "fix": ""}]
+        self._write_scan_result("a.py", vulns)
+        (self.root / "a.py").write_text("x = 1\n" + "# pad\n" * 1000)
+        with patch("builtins.print"):
+            plan = ss.plan_verification(
+                self.cfg, self.root, self.state, reverify=False,
+                max_file_size=1024,
+            )
+        self.assertEqual(plan["files_to_verify"], [])
+
+    def test_run_verification_uses_passed_plan(self):
+        """A pre-computed plan must be used as-is: no second pre-check."""
+        vulns = [{"line": 1, "severity": "High", "code": "x",
+                  "explanation": "", "fix": ""}]
+        self._write_scan_result("a.py", vulns)
+        plan = ss.plan_verification(
+            self.cfg, self.root, self.state, reverify=False,
+        )
+        tracker = ss.ProgressTracker(enabled=True)
+        with patch.object(ss, "plan_verification",
+                          side_effect=AssertionError("should not re-plan")) as mock_plan, \
+             patch.object(ss, "call_pi", return_value=("ok", json.dumps([
+                 {"line": 1, "confidence": "High", "exploitable": "yes",
+                  "verification_reason": "ok"},
+             ]))) as mock_pi, \
+             patch.object(tracker, "_ensure_render_thread"), \
+             patch("builtins.print"):
+            ss.run_verification(
+                "B3", self.cfg, self.root, self.state, self.sessions,
+                concurrency=1, reverify=False, dry_run=False,
+                progress=tracker, scanner_index=1, plan=plan,
+            )
+        mock_plan.assert_not_called()
+        self.assertEqual(mock_pi.call_count, 1)
+        with tracker._lock:
+            self.assertEqual(tracker._phases["verify"]["total"], 1)
+            self.assertEqual(tracker._phases["verify"]["completed"], 1)
 
     def test_size_limit_skips_oversized_stale_scan_result(self):
         """A scan result cached for a file that has since grown past

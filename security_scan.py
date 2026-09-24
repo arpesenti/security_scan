@@ -773,6 +773,29 @@ class ProgressTracker:
         progress.tick("scan")
         progress.stop()                             # prints final line
 
+    Grouped usage (one batch per OWASP scanner, so counters accumulate
+    across batches instead of resetting per scanner):
+
+        progress.plan_phase("verify", group_count=10)
+        for i, cfg in enumerate(scanners, start=1):
+            progress.start_group("verify", cfg["name"], total=42, index=i)
+            ...                                      # call tick() per completed item
+        # renders: [verify 3/10 access_control] 41/120 (0.1/s, ETA 5h07m) · [overall] ETA ≥1d02h
+
+    When every batch's total is known up front (e.g. the verify pre-check
+    has already run for all scanners), register them with `plan_group`
+    before any work starts. Totals are then known for the whole phase and
+    the overall ETA is exact instead of a lower bound; `start_group` marks
+    each batch as started when its work begins.
+
+    A phase is either flat (`start_phase`: one self-contained batch) or
+    grouped (`plan_phase` + `start_group`). A grouped phase reports a
+    cumulative count across every batch started so far plus the current
+    batch index. Once a plan exists, an `[overall]` segment is appended:
+    it sums the per-phase ETAs, and is prefixed with `≥` while planned
+    batches haven't started yet (their totals are unknown, so the sum is
+    a lower bound).
+
     Rendering strategy:
       - On a TTY, refreshes every `refresh_interval` seconds using `\\r` so
         the line overwrites itself in place. Padded with spaces to clear
@@ -788,7 +811,11 @@ class ProgressTracker:
     def __init__(self, enabled: bool = True, refresh_interval: float = 0.5):
         self.enabled = enabled
         self.refresh_interval = refresh_interval
-        # phase name -> {total, completed, started_at}
+        # phase name -> cumulative counters plus per-batch detail:
+        #   total, completed, started_at   cumulative across all batches
+        #   groups: {key: {total, completed, started_at, index, label}}
+        #   current: batch key that tick() advances (None for flat phases)
+        #   group_count: planned number of batches (None for flat phases)
         self._phases: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -798,27 +825,155 @@ class ProgressTracker:
         # updates so each tick is its own grep-able line.
         self._use_cr = enabled and sys.stderr.isatty()
 
-    def start_phase(self, phase: str, total: int) -> None:
+    @staticmethod
+    def _new_entry() -> dict:
+        return {
+            "total": 0,
+            "completed": 0,
+            "started_at": None,
+            "groups": {},
+            "current": None,
+            "group_count": None,
+        }
+
+    @staticmethod
+    def _recompute(entry: dict) -> None:
+        """Keep the cumulative counters in sync with the per-batch ones."""
+        if entry["groups"]:
+            entry["total"] = sum(g["total"] for g in entry["groups"].values())
+            entry["completed"] = sum(
+                g["completed"] for g in entry["groups"].values()
+            )
+
+    def plan_phase(self, phase: str, group_count: int) -> None:
+        """Declare that `phase` will run as `group_count` batches.
+
+        Batches that haven't started yet count as unknown work: the overall
+        ETA stays a lower bound until every planned batch has started, at
+        which point every total in the phase is known and the sum is exact.
+        """
         if not self.enabled:
             return
         with self._lock:
-            self._phases[phase] = {
-                "total": max(int(total), 0),
-                "completed": 0,
-                "started_at": time.time(),
-            }
+            entry = self._phases.setdefault(phase, self._new_entry())
+            entry["group_count"] = max(int(group_count), 0)
+        self._ensure_render_thread()
+
+    def start_phase(self, phase: str, total: int) -> None:
+        """Flat phase: one self-contained batch, replacing any previous
+        state for `phase`."""
+        if not self.enabled:
+            return
+        with self._lock:
+            entry = self._new_entry()
+            entry["total"] = max(int(total), 0)
+            entry["started_at"] = time.time()
+            self._phases[phase] = entry
+        self._ensure_render_thread()
+
+    def plan_group(
+        self,
+        phase: str,
+        group: str,
+        total: int,
+        index: int | None = None,
+        label: str | None = None,
+    ) -> None:
+        """Register a batch's total without starting it.
+
+        Planning batches up front makes a phase's totals known before any
+        work runs, so the overall ETA is exact rather than a lower bound.
+        `start_group` marks the batch as started when its work begins; a
+        planned-but-unstarted batch never shows `(done)`.
+        """
+        if not self.enabled:
+            return
+        with self._lock:
+            entry = self._phases.setdefault(phase, self._new_entry())
+            g = entry["groups"].get(group)
+            if g is None:
+                g = {"total": 0, "completed": 0, "started": False,
+                     "started_at": None, "index": None, "label": None}
+                entry["groups"][group] = g
+            g["total"] = max(int(total), 0)
+            if index is not None:
+                g["index"] = int(index)
+            elif g["index"] is None:
+                g["index"] = len(entry["groups"])
+            g["label"] = label if label is not None else group
+            self._recompute(entry)
+        self._ensure_render_thread()
+
+    def start_group(
+        self,
+        phase: str,
+        group: str,
+        total: int,
+        index: int | None = None,
+        label: str | None = None,
+    ) -> None:
+        """Start one batch of a grouped phase.
+
+        Counters are cumulative across batches: `total` grows as each batch
+        starts, and `tick(phase)` advances whichever batch started most
+        recently. A batch with `total=0` is still registered so the plan
+        accounting knows it was handled. A batch previously registered by
+        `plan_group` keeps its total and is marked as started here.
+        """
+        if not self.enabled:
+            return
+        with self._lock:
+            entry = self._phases.setdefault(phase, self._new_entry())
+            g = entry["groups"].get(group)
+            if g is None:
+                g = {"total": 0, "completed": 0, "started": False,
+                     "started_at": None, "index": None, "label": None}
+                entry["groups"][group] = g
+            g["total"] = max(int(total), 0)
+            g["started"] = True
+            g["started_at"] = time.time()
+            if index is not None:
+                g["index"] = int(index)
+            elif g["index"] is None:
+                g["index"] = len(entry["groups"])
+            g["label"] = label if label is not None else group
+            entry["current"] = group
+            if entry["started_at"] is None:
+                entry["started_at"] = time.time()
+            self._recompute(entry)
         self._ensure_render_thread()
 
     def tick(self, phase: str, amount: int = 1) -> None:
+        """Advance the most recently started batch (or the flat phase)."""
         if not self.enabled:
             return
         with self._lock:
             entry = self._phases.get(phase)
-            if entry is not None:
+            if entry is None:
+                return
+            current = entry["current"]
+            if current is not None and current in entry["groups"]:
+                g = entry["groups"][current]
+                g["completed"] = min(g["completed"] + amount, g["total"])
+                self._recompute(entry)
+            else:
                 entry["completed"] = min(
                     entry["completed"] + amount,
                     entry["total"],
                 )
+
+    def tick_group(self, phase: str, group: str, amount: int = 1) -> None:
+        """Advance one named batch explicitly, for callers that complete
+        batches out of order."""
+        if not self.enabled:
+            return
+        with self._lock:
+            entry = self._phases.get(phase)
+            if entry is None or group not in entry["groups"]:
+                return
+            g = entry["groups"][group]
+            g["completed"] = min(g["completed"] + amount, g["total"])
+            self._recompute(entry)
 
     def stop(self) -> None:
         if not self.enabled:
@@ -845,6 +1000,85 @@ class ProgressTracker:
             # sleep in small slices so stop() returns promptly
             self._stop_event.wait(self.refresh_interval)
 
+    @staticmethod
+    def _phase_rate(entry: dict, now: float) -> float:
+        """Cumulative items/sec for a phase, 0.0 while nothing has finished."""
+        started_at = entry["started_at"]
+        if not started_at or entry["completed"] <= 0:
+            return 0.0
+        return entry["completed"] / max(now - started_at, 1e-6)
+
+    def _render_flat(self, phase: str, data: dict, now: float) -> str | None:
+        total = data["total"]
+        if total <= 0:
+            return None
+        completed = data["completed"]
+        if completed >= total:
+            return f"[{phase}] {completed}/{total} (done)"
+        rate = self._phase_rate(data, now)
+        eta = (total - completed) / rate if rate > 0 else float("inf")
+        return (
+            f"[{phase}] {completed}/{total} "
+            f"({rate:.1f}/s, ETA {_format_eta(eta)})"
+        )
+
+    def _render_grouped(self, phase: str, data: dict, now: float) -> str | None:
+        total = data["total"]
+        if total <= 0:
+            return None
+        completed = data["completed"]
+        current = data["groups"].get(data["current"] or "", {})
+        bits = [phase]
+        index = current.get("index")
+        count = data["group_count"]
+        if index is not None:
+            bits.append(f"{index}/{count}" if count else str(index))
+        if current.get("label"):
+            bits.append(str(current["label"]))
+        prefix = "[" + " ".join(bits) + "]"
+        all_started = (
+            (count is None or len(data["groups"]) >= count)
+            and all(g["started"] for g in data["groups"].values())
+        )
+        if completed >= total and all_started:
+            return f"{prefix} {completed}/{total} (done)"
+        rate = self._phase_rate(data, now)
+        eta = (total - completed) / rate if rate > 0 else float("inf")
+        return (
+            f"{prefix} {completed}/{total} "
+            f"({rate:.1f}/s, ETA {_format_eta(eta)})"
+        )
+
+    def _render_overall(self, now: float) -> str:
+        """Sum of per-phase ETAs across the whole planned run.
+
+        `≥` means the sum is a lower bound because at least one planned
+        batch hasn't started (its total is unknown) or a phase has remaining
+        work but no measurable rate yet. `?` means nothing could be bounded.
+        Called with `self._lock` held.
+        """
+        known = 0.0
+        any_work = False
+        unknown = False
+        for data in self._phases.values():
+            count = data["group_count"]
+            if count is not None and len(data["groups"]) < count:
+                unknown = True
+            remaining = max(data["total"] - data["completed"], 0)
+            if remaining <= 0:
+                continue
+            any_work = True
+            rate = self._phase_rate(data, now)
+            if rate <= 0:
+                unknown = True
+                continue
+            known += remaining / rate
+        if not any_work:
+            return "[overall] done" if not unknown else "[overall] ETA ?"
+        if known <= 0:
+            return "[overall] ETA ?"
+        return f"[overall] ETA {'≥' if unknown else ''}{_format_eta(known)}"
+
     def _render(self, force_newline: bool = False) -> None:
         if not self.enabled:
             return
@@ -853,24 +1087,21 @@ class ProgressTracker:
                 return
             parts: list[str] = []
             now = time.time()
+            has_plan = False
             for phase, data in self._phases.items():
-                total = data["total"]
-                if total <= 0:
-                    continue
-                completed = data["completed"]
-                if completed >= total:
-                    parts.append(f"[{phase}] {completed}/{total} (done)")
-                    continue
-                elapsed = max(now - data["started_at"], 1e-6)
-                rate = completed / elapsed
-                remaining = total - completed
-                eta = remaining / rate if rate > 0 else float("inf")
-                parts.append(
-                    f"[{phase}] {completed}/{total} "
-                    f"({rate:.1f}/s, ETA {_format_eta(eta)})"
-                )
-        if not parts:
-            return
+                if data["group_count"] is not None:
+                    has_plan = True
+                if data["groups"]:
+                    has_plan = True
+                    part = self._render_grouped(phase, data, now)
+                else:
+                    part = self._render_flat(phase, data, now)
+                if part:
+                    parts.append(part)
+            if not parts:
+                return
+            if has_plan:
+                parts.append(self._render_overall(now))
         line = " · ".join(parts)
         # Pad to 80 chars so a shorter line overwrites any residue from
         # a longer previous one when we're using \r. Off-TTY we don't pad
@@ -895,7 +1126,10 @@ def _format_eta(seconds: float) -> str:
     if minutes < 60:
         return f"{minutes}m{secs:02d}s"
     hours, mins = divmod(minutes, 60)
-    return f"{hours}h{mins:02d}m"
+    if hours < 24:
+        return f"{hours}h{mins:02d}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours:02d}h"
 
 
 # ── Phase 1: Discovery ──────────────────────────────────────────────────────
@@ -1380,48 +1614,36 @@ def verify_finding(
     return data
 
 
-def run_verification(
-    scanner_id: str,
+def plan_verification(
     scanner_cfg: dict,
     repo_root: Path,
     state_dir: Path,
-    session_dir: Path,
-    concurrency: int,
     reverify: bool,
-    dry_run: bool,
-    verify_timeout: int = 300,
     tools: list[str] | None = None,
     scan_uses_tools: bool = False,
     thinking: str = "medium",
     max_file_size: int = DEFAULT_MAX_FILE_SIZE,
-    progress: "ProgressTracker | None" = None,
-) -> tuple[dict, list[dict]]:
-    """Phase 3: Verify findings for every file that has at least one finding
-    in this scanner's results dir. Files with no findings, suppressed
-    findings only, or scan errors are skipped - there is nothing to verify.
+) -> dict:
+    """Pre-check one scanner's verify work without making any model calls.
 
-    Two independent tool flags:
+    Returns a plan dict consumed by `run_verification`:
 
-    - `tools` controls whether the verifier itself runs with read-only
-      tools, and where its output lives (`verifications-tools/` vs
-      `verifications/`).
-    - `scan_uses_tools` controls where the scan results to be verified
-      live (`results-tools/` vs `results/`). The verify phase must read
-      from the same dir the scan wrote to, so this is a separate flag —
-      you can run with `--scan-tools` off and `--verify-tools` on, and
-      the verifier still finds the scan output in `results/`.
+        results_dir, verify_dir      where scan results are read from and
+                                     verdicts are cached (tools-aware)
+        verify_template              loaded verify prompt template
+        verify_prompt_hash           hash of that template, for cache keys
+        files_to_verify              [(filepath, rel, result_file), ...]
+        cached_count                 files with findings whose verdict is
+                                     already cached (excluded from work)
 
-    `thinking` controls `pi --thinking` for every file in this verify
-    pass. Defaults to `"medium"` — per-finding judgment benefits from
-    chain-of-thought. The cache key includes thinking so different
-    levels never share a verdict.
+    Same skip rules as the verify phase itself: files with no findings,
+    scan errors/timeouts, missing source files, oversized files, and
+    (unless `reverify`) files whose verdict is already cached are excluded.
 
-    `max_file_size` is a defensive re-check of the same size limit
-    applied at discovery. Stale scan results (cached before the user
-    set a size limit, or for files that have grown since the scan) are
-    skipped here so the verify phase doesn't try to read megabytes
-    into the prompt. Default 1 MiB (see `DEFAULT_MAX_FILE_SIZE`); pass
-    `0` to disable.
+    `files_to_verify` holds the scan-result *paths* rather than parsed
+    findings: `main()` plans every scanner up front so the whole phase's
+    totals are known before the first model call, and `run_verification`
+    materializes findings one scanner at a time to keep peak memory flat.
     """
     results_dir = state_dir / scanner_cfg["name"] / (
         "results-tools" if scan_uses_tools else "results"
@@ -1429,10 +1651,6 @@ def run_verification(
     verify_dir = state_dir / scanner_cfg["name"] / (
         "verifications-tools" if tools else "verifications"
     )
-    verify_dir.mkdir(parents=True, exist_ok=True)
-
-    if not results_dir.exists():
-        return scanner_cfg, []
 
     # Compute the verify prompt hash once so we can pre-check the cache for
     # each file. Files whose verdict is already cached are skipped from
@@ -1442,8 +1660,19 @@ def run_verification(
     verify_template = load_verify_prompt()
     v_prompt_hash = prompt_hash(verify_template)
 
-    files_to_verify: list[tuple[Path, str, list[dict]]] = []
+    files_to_verify: list[tuple[Path, str, Path]] = []
     cached_count = 0
+    if not results_dir.exists():
+        return {
+            "scanner_cfg": scanner_cfg,
+            "results_dir": results_dir,
+            "verify_dir": verify_dir,
+            "verify_template": verify_template,
+            "verify_prompt_hash": v_prompt_hash,
+            "files_to_verify": files_to_verify,
+            "cached_count": cached_count,
+        }
+
     for rf in sorted(results_dir.glob("*.json")):
         try:
             with open(rf) as f:
@@ -1514,7 +1743,118 @@ def run_verification(
                 # let verify_finding handle it (it will emit the error there).
                 pass
 
-        files_to_verify.append((filepath, rel, vulns))
+        files_to_verify.append((filepath, rel, rf))
+
+    return {
+        "scanner_cfg": scanner_cfg,
+        "results_dir": results_dir,
+        "verify_dir": verify_dir,
+        "verify_template": verify_template,
+        "verify_prompt_hash": v_prompt_hash,
+        "files_to_verify": files_to_verify,
+        "cached_count": cached_count,
+    }
+
+
+def run_verification(
+    scanner_id: str,
+    scanner_cfg: dict,
+    repo_root: Path,
+    state_dir: Path,
+    session_dir: Path,
+    concurrency: int,
+    reverify: bool,
+    dry_run: bool,
+    verify_timeout: int = 300,
+    tools: list[str] | None = None,
+    scan_uses_tools: bool = False,
+    thinking: str = "medium",
+    max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+    progress: "ProgressTracker | None" = None,
+    scanner_index: int | None = None,
+    plan: dict | None = None,
+) -> tuple[dict, list[dict]]:
+    """Phase 3: Verify findings for every file that has at least one finding
+    in this scanner's results dir. Files with no findings, suppressed
+    findings only, or scan errors are skipped - there is nothing to verify.
+
+    Two independent tool flags:
+
+    - `tools` controls whether the verifier itself runs with read-only
+      tools, and where its output lives (`verifications-tools/` vs
+      `verifications/`).
+    - `scan_uses_tools` controls where the scan results to be verified
+      live (`results-tools/` vs `results/`). The verify phase must read
+      from the same dir the scan wrote to, so this is a separate flag —
+      you can run with `--scan-tools` off and `--verify-tools` on, and
+      the verifier still finds the scan output in `results/`.
+
+    `thinking` controls `pi --thinking` for every file in this verify
+    pass. Defaults to `"medium"` — per-finding judgment benefits from
+    chain-of-thought. The cache key includes thinking so different
+    levels never share a verdict.
+
+    `max_file_size` is a defensive re-check of the same size limit
+    applied at discovery. Stale scan results (cached before the user
+    set a size limit, or for files that have grown since the scan) are
+    skipped here so the verify phase doesn't try to read megabytes
+    into the prompt. Default 1 MiB (see `DEFAULT_MAX_FILE_SIZE`); pass
+    `0` to disable.
+
+    When `scanner_index` is given (1-based), progress is reported as a
+    batch of the grouped `verify` phase, so counters accumulate across
+    scanners instead of resetting. The caller is expected to have called
+    `ProgressTracker.plan_phase("verify", <scanner count>)` first.
+
+    `plan` is an optional pre-computed `plan_verification` result. Callers
+    that plan every scanner up front — so the whole phase's totals are
+    known before the first model call — pass it here to avoid re-running
+    the pre-check. When omitted, the pre-check runs inline.
+    """
+    if plan is None:
+        plan = plan_verification(
+            scanner_cfg, repo_root, state_dir, reverify,
+            tools=tools, scan_uses_tools=scan_uses_tools,
+            thinking=thinking, max_file_size=max_file_size,
+        )
+    results_dir = plan["results_dir"]
+    verify_dir = plan["verify_dir"]
+    verify_dir.mkdir(parents=True, exist_ok=True)
+
+    if not results_dir.exists():
+        if progress is not None and scanner_index is not None:
+            # Register the empty batch so the phase's plan accounting
+            # knows this scanner is done.
+            progress.start_group("verify", scanner_cfg["name"], 0, index=scanner_index)
+        return scanner_cfg, []
+
+    verify_template = plan["verify_template"]
+    v_prompt_hash = plan["verify_prompt_hash"]
+    cached_count = plan["cached_count"]
+
+    # Materialize findings for this scanner only. Planning all scanners up
+    # front keeps the whole phase's totals known before the first model
+    # call; re-reading the result files here (instead of carrying parsed
+    # findings in every plan) keeps peak memory flat across scanners.
+    files_to_verify: list[tuple[Path, str, list[dict]]] = []
+    for filepath, rel, result_file in plan["files_to_verify"]:
+        try:
+            with open(result_file) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(
+                f"[WARN] Skipping verify of {rel}: unreadable scan result "
+                f"{result_file}: {e}",
+                file=sys.stderr,
+            )
+            continue
+        result = data.get("result", [])
+        vulns = (
+            [v for v in result if isinstance(v, dict)]
+            if isinstance(result, list) else []
+        )
+        if vulns:
+            files_to_verify.append((filepath, rel, vulns))
 
     print(f"\n{'=' * 60}")
     print(f" Verification: {scanner_cfg['id']} - {scanner_cfg['label']}")
@@ -1535,11 +1875,19 @@ def run_verification(
         return scanner_cfg, []
 
     if not files_to_verify:
+        if progress is not None and scanner_index is not None:
+            progress.start_group("verify", scanner_cfg["name"], 0, index=scanner_index)
         return scanner_cfg, []
 
     verified: list[dict] = []
     if progress is not None and files_to_verify:
-        progress.start_phase("verify", total=len(files_to_verify))
+        if scanner_index is not None:
+            progress.start_group(
+                "verify", scanner_cfg["name"], len(files_to_verify),
+                index=scanner_index,
+            )
+        else:
+            progress.start_phase("verify", total=len(files_to_verify))
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(
@@ -1742,6 +2090,7 @@ def run_scanner(
     tools: list[str] | None = None,
     thinking: str = "off",
     progress: "ProgressTracker | None" = None,
+    scanner_index: int | None = None,
 ) -> tuple[dict, list[dict]]:
     """Run a single OWASP scanner across relevant files.
 
@@ -1754,6 +2103,11 @@ def run_scanner(
     cache key includes thinking, so flipping it (e.g. via `--scan-thinking`)
     cleanly re-scans rather than reusing verdicts from a different model
     setting.
+
+    When `scanner_index` is given (1-based), progress is reported as a
+    batch of the grouped `scan` phase, so counters accumulate across
+    scanners instead of resetting. The caller is expected to have called
+    `ProgressTracker.plan_phase("scan", <scanner count>)` first.
     """
     results_dir = state_dir / scanner_cfg["name"] / (
         "results-tools" if tools else "results"
@@ -1825,11 +2179,20 @@ def run_scanner(
 
     if not pending:
         print(f"  All files cached. Use --rescan to force.")
+        if progress is not None and scanner_index is not None:
+            # Register the empty batch so the phase's plan accounting
+            # knows this scanner is done.
+            progress.start_group("scan", scanner_cfg["name"], 0, index=scanner_index)
         return scanner_cfg, []
 
     scanned = []
     if progress is not None and pending:
-        progress.start_phase("scan", total=len(pending))
+        if scanner_index is not None:
+            progress.start_group(
+                "scan", scanner_cfg["name"], len(pending), index=scanner_index,
+            )
+        else:
+            progress.start_phase("scan", total=len(pending))
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(
@@ -3273,8 +3636,8 @@ OWASP 2025 Categories:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Show an in-place stderr progress line with per-phase counters "
-             "and ETA. Default: on. Disable with --no-progress for quiet CI "
-             "logs or batch runs.",
+             "and an overall ETA. Default: on. Disable with --no-progress "
+             "for quiet CI logs or batch runs.",
     )
     parser.add_argument(
         "--max-file-size",
@@ -3418,6 +3781,16 @@ OWASP 2025 Categories:
     # final line is emitted — even on sys.exit() from the report gates.
     progress = ProgressTracker(enabled=bool(args.progress))
     try:
+        # Declare the shape of the run up front: each phase runs one batch
+        # per selected scanner. Batches that haven't started yet have
+        # unknown totals, so the overall ETA is reported as a lower bound
+        # until they do.
+        if not args.dry_run:
+            if args.phase not in (1, 3):  # scan runs for phases 0 and 2
+                progress.plan_phase("scan", len(scanner_ids))
+            if run_verify:
+                progress.plan_phase("verify", len(scanner_ids))
+
         # ── Phase 1: Discovery ──
         discovery_map = {}
         if args.phase == 0 or args.phase == 1:
@@ -3463,7 +3836,7 @@ OWASP 2025 Categories:
             if args.formats:
                 format_override = [e if e.startswith(".") else f".{e}" for e in args.formats.split(",")]
     
-            for scanner_id in scanner_ids:
+            for scan_index, scanner_id in enumerate(scanner_ids, start=1):
                 cfg = OWASP_SCANNERS[scanner_id]
                 _, results = run_scanner(
                     scanner_id, cfg, ext_map, name_map, discovery_map,
@@ -3474,6 +3847,7 @@ OWASP 2025 Categories:
                     tools=phase_tool_lists["scan"],
                     thinking=args.scan_thinking,
                     progress=progress,
+                    scanner_index=scan_index,
             )
             all_results.extend(results)
     
@@ -3503,7 +3877,30 @@ OWASP 2025 Categories:
                 print("=" * 60)
                 print(" Phase 3: Verifying findings...")
                 print("=" * 60)
-                for scanner_id in scanner_ids:
+                # Plan every scanner's verify batch before the first model
+                # call (cache reads only) so the tracker knows the whole
+                # phase's totals and the overall ETA is exact instead of a
+                # lower bound. Skipped when progress is off: the planning
+                # pass only earns its extra read when someone is watching.
+                plans: list[dict] | None = None
+                if progress.enabled:
+                    plans = [
+                        plan_verification(
+                            OWASP_SCANNERS[sid], repo_root, state_dir,
+                            args.reverify,
+                            tools=phase_tool_lists["verify"],
+                            scan_uses_tools=phase_tools["scan"],
+                            thinking=args.verify_thinking,
+                            max_file_size=args.max_file_size,
+                        )
+                        for sid in scanner_ids
+                    ]
+                    for plan_index, planned in enumerate(plans, start=1):
+                        progress.plan_group(
+                            "verify", planned["scanner_cfg"]["name"],
+                            len(planned["files_to_verify"]), index=plan_index,
+                        )
+                for verify_index, scanner_id in enumerate(scanner_ids, start=1):
                     cfg = OWASP_SCANNERS[scanner_id]
                     _, vresults = run_verification(
                         scanner_id, cfg, repo_root, state_dir, session_dir,
@@ -3514,7 +3911,13 @@ OWASP 2025 Categories:
                         thinking=args.verify_thinking,
                         max_file_size=args.max_file_size,
                         progress=progress,
+                        scanner_index=verify_index,
+                        plan=plans[verify_index - 1] if plans is not None else None,
                     )
+                    if plans is not None:
+                        # Drop the consumed plan so its file list is freed
+                        # while the remaining scanners verify.
+                        plans[verify_index - 1] = None
                     # Verification results are read back from disk in build_report
                     # via load_verification_for_file, so we don't need to forward
                     # them here. The list is kept for parity with the scan loop.

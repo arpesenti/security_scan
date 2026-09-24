@@ -23,8 +23,8 @@ to rate each finding's confidence and exploitability in the context of the file 
 - **Configurable file size limit** (`--max-file-size`) — exclude oversized files (auto-
   generated bundles, vendored minified JS, lockfiles) from discovery and all subsequent
   phases
-- **In-place progress line** with per-phase count + rate + ETA, on stderr, TTY-aware
-  (`--no-progress` to silence)
+- **In-place progress line** with cumulative per-phase counts, current scanner batch, rate
+  and per-phase + overall ETA, on stderr, TTY-aware (`--no-progress` to silence)
 - **Tools-on scan by default** (`--no-scan-tools` to opt out): phase 2 runs with read-only
   tools so the scanner can inspect callers, sanitizers, and auth middleware in related files
 - **Refutation-first report buckets** (when verification ran): refuted findings leave
@@ -265,11 +265,22 @@ scanner writes a single in-place progress line to **stderr** while the
 work is in flight. It looks like:
 
 ```
-[scan] 123/9005 (12.3/s, ETA 12m)    [verify] 50/200 (5.0/s, ETA 30s)
+[scan 10/10] 55810/55810 (done) · [verify 3/10 access_control] 41230/112460 (0.1/s, ETA 5h07m) · [overall] ETA 1d02h
 ```
 
-The line is updated every 0.5s by a daemon thread and shows the current
-phase, completed/total count, throughput in items/sec, and an ETA.
+The line is updated every 0.5s by a daemon thread. Each phase segment
+shows the current batch (which scanner, out of the selected ones), a
+**cumulative** completed/total count across every batch so far (counters
+no longer reset per scanner), throughput in items/sec, and an ETA for
+that phase. ETAs longer than a day render as `1d02h`.
+
+Once a run is planned, an `[overall]` segment sums the per-phase ETAs for
+the whole run. During scan it is prefixed with `≥`: the verify phase's
+totals depend on which files turn out to have findings, so the sum is a
+lower bound. Before verification starts, every scanner's cache pre-check
+runs up front (cache reads only, no model calls), so all verify totals
+are known and the overall ETA becomes exact. `[overall] ETA ?` means no
+remaining work has a measurable rate yet.
 
 **TTY-aware**:
 - On an interactive terminal, it uses `\r` so the line overwrites itself
@@ -320,7 +331,7 @@ each is independently grep-able.
 | `--scan-thinking LEVEL` | `off` | Reasoning effort for the scan phase: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. Scan is high-recall pattern enumeration; the model already has the whole file inline, so chain-of-thought adds latency without recall benefit. Cache key includes this value. |
 | `--verify-thinking LEVEL` | `medium` | Reasoning effort for the verify phase. Per-finding judgment benefits from chain-of-thought. Cache key includes this value. |
 | `--max-file-size BYTES` | `1048576` (1 MiB) | Skip files larger than this during discovery, so they're also skipped in scan and verify (defensive re-check). The default catches auto-generated bundles, vendored minified JS, lockfiles, and generated protobufs while fitting comfortably in any modern model's context window. Set to `0` to disable the cap entirely. |
-| `--progress` / `--no-progress` | on | Show an in-place stderr progress line with per-phase counts and ETA. Use `--no-progress` for quiet CI logs. |
+| `--progress` / `--no-progress` | on | Show an in-place stderr progress line with cumulative per-phase counts and per-phase + overall ETA. Use `--no-progress` for quiet CI logs. |
 | `--export-allowlist-candidates` | off | Export candidate suppression entries derived from Refuted Findings into `allowlist.json` (marked `status: candidate`). Candidates suppress nothing until a human flips status to `confirmed`. Idempotent on re-export. |
 
 ## Cache invalidation
