@@ -381,6 +381,62 @@ def verify_file_key(
     ).hexdigest()
 
 
+# Lone UTF-16 surrogates (U+D800..U+DFFF) are the one thing a Python str can
+# hold that UTF-8 cannot encode. They reach this script from two ordinary
+# sources: `json.loads` preserves a `\udXXX` escape that is not part of a
+# valid pair as a surrogate code point, and Unix paths decoded from
+# undecodable bytes arrive surrogate-escaped. Strict UTF-8 writers
+# (`Path.write_text`, `open(..., encoding="utf-8")`) raise
+# `UnicodeEncodeError: surrogates not allowed` on either, so every string
+# headed for a report file passes through `sanitize_text` first.
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def sanitize_text(text: str) -> str:
+    """Replace unpaired UTF-16 surrogates with U+FFFD, leaving all other
+    text untouched.
+
+    A lone surrogate denotes a character whose bytes were lost (truncated
+    model output, an undecodable filename byte), so the replacement
+    character is the honest rendering. A *paired* surrogate is recombined
+    into the astral character it stands for (U+10000..U+10FFFF); Python's
+    `json` decoder normally does that already, but combining defensively
+    keeps a genuine emoji from being flattened into two U+FFFDs when the
+    input string arrived some other way.
+    """
+    if not _SURROGATE_RE.search(text):
+        return text
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        code = ord(text[i])
+        if 0xD800 <= code <= 0xDBFF and i + 1 < n:
+            low = ord(text[i + 1])
+            if 0xDC00 <= low <= 0xDFFF:
+                out.append(chr(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)))
+                i += 2
+                continue
+        out.append("\ufffd" if 0xD800 <= code <= 0xDFFF else text[i])
+        i += 1
+    return "".join(out)
+
+
+def sanitize_json_value(value: object) -> object:
+    """Recursively apply `sanitize_text` to every string in a parsed JSON
+    value (dict keys included), returning containers of the same shape."""
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, list):
+        return [sanitize_json_value(v) for v in value]
+    if isinstance(value, dict):
+        return {
+            sanitize_text(k) if isinstance(k, str) else k: sanitize_json_value(v)
+            for k, v in value.items()
+        }
+    return value
+
+
 def _strip_code_fences(text: str) -> str:
     """Strip ```json ... ``` / ``` ... ``` fences from model output.
 
@@ -1314,7 +1370,7 @@ def run_discovery(
         for sid, cfg in OWASP_SCANNERS.items():
             result[sid] = cfg["base_ext"]
     else:
-        parsed = extract_json_object(raw)
+        parsed = sanitize_json_value(extract_json_object(raw))
         if isinstance(parsed, dict):
             result = parsed
         else:
@@ -1599,6 +1655,9 @@ def verify_finding(
         parsed: object = {"error": raw[:2000]}
     else:
         parsed = extract_json_array(raw)
+    # Same treatment as the scan phase: verdict reasons are rendered into
+    # the report verbatim, so they must be UTF-8 encodable.
+    parsed = sanitize_json_value(parsed)
 
     # Normalize the parsed response into a line-keyed map of
     # {confidence, exploitable, verification_reason}. The scan report joins
@@ -2092,6 +2151,10 @@ def scan_file(
         parsed = {"error": raw[:2000]}
     else:
         parsed = extract_json_array(raw)
+    # Model JSON with a lone `\udXXX` escape would otherwise reach the
+    # report (and future cache reads) as a surrogate and crash the strict
+    # UTF-8 report writer.
+    parsed = sanitize_json_value(parsed)
 
     # Post-parse tagging (no extra model calls): findings without a named
     # source carry the `unsubstantiated` tag in the cached result, which the
@@ -3150,7 +3213,15 @@ def build_report(
 
     # Write
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(lines) + "\n")
+    # Defensive backstop: findings cached by an older revision can still
+    # carry surrogates (json.dumps escapes them on write and json.loads
+    # restores them on read), and so can surrogate-escaped filenames from
+    # the walking phase. Sanitizing here keeps one bad byte from aborting
+    # the whole report after hours of scanning. Encoding is explicit so the
+    # markdown does not depend on the runner's locale.
+    output_path.write_text(
+        sanitize_text("\n".join(lines) + "\n"), encoding="utf-8",
+    )
 
     # Console summary
     print()
@@ -3513,7 +3584,9 @@ def build_csv_report(
         )
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            # Same surrogate backstop as build_report: stale caches and
+            # surrogate-escaped paths must not abort the write.
+            writer.writerow(sanitize_json_value(row))
 
     active_count = sum(1 for r in rows if r["status"] == "active")
     needs_review_rows = sum(1 for r in rows if r["status"] == "needs_review")

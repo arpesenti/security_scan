@@ -344,6 +344,42 @@ class TestExtractJson(unittest.TestCase):
         self.assertEqual(out, {"B1": [".py"]})
 
 
+class TestSanitizeText(unittest.TestCase):
+    """Lone UTF-16 surrogates must be replaced before any report write;
+    a valid pair must survive as the astral character it encodes."""
+
+    def test_plain_text_unchanged(self):
+        self.assertEqual(ss.sanitize_text("hello wörld 🔒"), "hello wörld 🔒")
+
+    def test_lone_high_surrogate_replaced(self):
+        self.assertEqual(ss.sanitize_text("a\ud83db"), "a\ufffdb")
+
+    def test_lone_low_surrogate_replaced(self):
+        self.assertEqual(ss.sanitize_text("a\udcffb"), "a\ufffdb")
+
+    def test_valid_pair_recombined(self):
+        # json.loads normally combines pairs already; combining here keeps a
+        # genuine emoji from becoming two replacement characters when the
+        # string arrived some other way.
+        self.assertEqual(ss.sanitize_text("a\ud83d\ude00b"), "a😀b")
+
+    def test_result_is_utf8_encodable(self):
+        ss.sanitize_text("x\udcffy").encode("utf-8")  # must not raise
+
+    def test_json_value_sanitizes_nested_strings_and_keys(self):
+        value = {"k\udcff": ["v\ud83d", {"n": "ok"}]}
+        self.assertEqual(
+            ss.sanitize_json_value(value),
+            {"k\ufffd": ["v\ufffd", {"n": "ok"}]},
+        )
+
+    def test_json_value_leaves_non_strings_alone(self):
+        self.assertEqual(
+            ss.sanitize_json_value({"n": 1, "b": True, "x": None}),
+            {"n": 1, "b": True, "x": None},
+        )
+
+
 class TestAllowlist(unittest.TestCase):
     def test_missing_file_returns_empty(self):
         with tempfile.TemporaryDirectory() as td:
@@ -789,6 +825,40 @@ class TestBuildReport(unittest.TestCase):
             {"B3": [".py"]}, allowlist=[],
         )
         self.assertEqual(stats["scanned_count"], 1)
+
+    def test_lone_surrogate_in_finding_does_not_crash_report(self):
+        """json.loads keeps a `\\udXXX` escape that is not part of a valid
+        pair as a lone surrogate; the strict UTF-8 report writer must not
+        abort on it."""
+        self._write_result("B3", "a.py", [
+            {"line": 1, "severity": "High", "code": "x\udcffy",
+             "explanation": "truncated \ud83d", "fix": ""},
+        ])
+        ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        text = self.output.read_text(encoding="utf-8")
+        self.assertIn("x\ufffdy", text)
+        self.assertNotIn("\udcff", text)
+
+    def test_lone_surrogate_in_file_path_does_not_crash_report(self):
+        """Surrogate-escaped filenames (invalid UTF-8 bytes on disk) land on
+        the report's file tables the same way as model text."""
+        data = {
+            "file": "bad\udcff.py", "scanner": "injection", "status": "ok",
+            "result": [{"line": 1, "severity": "High", "code": "x",
+                        "explanation": "", "fix": ""}],
+        }
+        (self.state / "injection" / "results" / "surrogate_path.json").write_text(
+            json.dumps(data)
+        )
+        ss.build_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        text = self.output.read_text(encoding="utf-8")
+        self.assertIn("bad\ufffd.py", text)
 
 
 class TestCLI(unittest.TestCase):
@@ -1512,6 +1582,18 @@ class TestBuildCsvReport(unittest.TestCase):
             header = f.readline().strip().split(",")
         for col in ss.CSV_FIELDNAMES:
             self.assertIn(col, header, f"Missing column: {col}")
+
+    def test_lone_surrogate_in_finding_does_not_crash_csv(self):
+        self._write_scan("a.py", [
+            {"line": 1, "severity": "High", "code": "x\udcffy",
+             "explanation": "", "fix": ""},
+        ])
+        ss.build_csv_report(
+            self.state, self.output, self.root, ["B3"],
+            {"B3": [".py"]}, allowlist=[],
+        )
+        rows = self._read_csv(self.output)
+        self.assertEqual(rows[0]["code"], "x\ufffdy")
 
     def test_suppressed_finding_marked_with_reason(self):
         self._write_scan("a.py", [
